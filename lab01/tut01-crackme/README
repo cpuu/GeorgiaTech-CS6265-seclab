@@ -1,0 +1,272 @@
+=================
+Lec01: Warming up
+=================
+
+1. Registration
+===============
+
+ - On-site (CS-6265-A): https://allspark.gtisc.gatech.edu:5001
+ - OMSCS (CS-6265-O01): https://allspark.gtisc.gatech.edu:5002
+ - OCY   (CS-6265-OCY): https://allspark.gtisc.gatech.edu:5003
+ https://computron.gtisc.gatech.edu/
+
+Did you get an api-key through email? The api-key is essentially your
+identity for this class. Once you receive api-key, you can login to
+the course website. After you login successfully, you should upload your
+public-key, then we will generate your user account on the course VM.
+
+If you find difficulty in registration, please send us an email.
+(6265-staff@cc.gatech.edu)
+
+2. Please read!
+===============
+
+ - https://tc.gts3.org/cs6265/2019/rules.html
+
+3. IOLI-crackme
+===============
+
+Did you successfully connect to the CTF server? Let's play with a binary.
+
+We prepared four binaries. The goal is very simple: find a password
+that each binary accepts. Before tackling this week's challenges,
+you will learn how to use GDB, how to read x86 assembly,
+and a hacker's mindset!
+
+We highly recommend you to tackle crackme binaries first
+before jumping into the "bomblab". In bomblab, if you make a mistake
+(i.e., exploding the bomb), you will get some deduction.
+
+In this tutorial, we will walk together to solve two binaries.
+
+
+3.1. crackme0x00
+----------------
+
+    *IMPORTANT*
+    First of all, refer to Canvas announcement
+    for ssh information and login password!
+
+    $ cd tut01-crackme
+    $ ./crackme0x00
+    IOLI Crackme Level 0x00
+    Password: 1234
+    Invalid Password!
+
+ 3.1.1. Where to start?
+
+   There are many ways to start:
+     1) reading the whole binary first (e.g., try "objdump -d crackme0x00");
+     2) starting a gdb session (e.g., "gdb ./crackme0x00") and setting
+       a breakpoint on a well-known entry (e.g., if you're luckly,
+       main() is exposed. Try "nm crackme0x00" to find out);
+     3) running ./crackme0x00 first (which will wait on the "Password" prompt)
+       and attachng it to gdb (e.g., "gdb -p $(pgrep crackme0x00)");
+     4) or just running with gdb then press "C-c" (i.e., sending a SIGINT signal).
+
+ 3.1.2. Let's take 4) as an example
+
+    $ gdb ./crackme0x00
+    Reading symbols from ./crackme0x00...(no debugging symbols found)...done.
+    (gdb) r
+
+    ; [r]un: run a program, please check "help run"
+
+    Starting program: /home/lab01/tut01-crackme/crackme0x00
+    IOLI Crackme Level 0x00
+    Password: ^C
+
+    ; press ctrl+C (^C) to send a signal to stop the process
+
+    Program received signal SIGINT, Interrupt.
+    0xf7fd8d09 in __kernel_vsyscall ()
+    (gdb) bt
+    #0  0xf7fd3069 in __kernel_vsyscall ()
+    #1  0xf7e8cd17 in read () from /usr/lib32/libc.so.6
+    #2  0xf7e18ab8 in __GI__IO_file_underflow () from /usr/lib32/libc.so.6
+    #3  0xf7e19bec in __GI__IO_default_uflow () from /usr/lib32/libc.so.6
+    #4  0xf7dfd98f in __GI__IO_vfscanf () from /usr/lib32/libc.so.6
+    #5  0xf7e08f15 in scanf () from /usr/lib32/libc.so.6
+    #6  0x080492fa in main (argc=1, argv=0xffffcbf4) at crackme0x00.c:14
+
+    ; [bt]: print backtrace (e.g., stack frames). Again, don't forget
+    ; to check "help bt"
+
+    (gdb) tbreak *0x080492fa
+    Temporary breakpoint 1 at 0x080492fa
+
+    ; set a (temporary) breakpoint (help b, tb, rb) to the call site (next)
+    ; of the scanf(), which is potentially the most interesting part.
+
+    (gdb) c
+    Continuing.
+    aaaaaaaaaaaaaaaaaaaaaaaa
+
+    ; [c]ontinue to run the process, type "aaaaaaaaaaaaaa" (inject a random input)
+
+    Temporary breakpoint 1, 0x080492fa in main ()
+
+    ; Ok, it hits the breakpoint. Let's check the context
+    ; [disas]semble: dump the assembly code in the current scope
+
+    (gdb) disas
+    Dump of assembler code for function main:
+        0x080492b8 <+0>:     lea    ecx,[esp+0x4]
+        0x080492bc <+4>:     and    esp,0xfffffff0
+        0x080492bf <+7>:     push   DWORD PTR [ecx-0x4]
+        0x080492c2 <+10>:    push   ebp
+        0x080492c3 <+11>:    mov    ebp,esp
+        0x080492c5 <+13>:    push   ecx
+        0x080492c6 <+14>:    sub    esp,0x14
+        0x080492c9 <+17>:    sub    esp,0xc
+        0x080492cc <+20>:    push   0x804a05c
+        0x080492d1 <+25>:    call   0x8049080 <puts@plt>
+        0x080492d6 <+30>:    add    esp,0x10
+        0x080492d9 <+33>:    sub    esp,0xc
+        0x080492dc <+36>:    push   0x804a074
+        0x080492e1 <+41>:    call   0x8049040 <printf@plt>
+        0x080492e6 <+46>:    add    esp,0x10
+        0x080492e9 <+49>:    sub    esp,0x8
+        0x080492ec <+52>:    lea    eax,[ebp-0x18]
+        0x080492ef <+55>:    push   eax
+        0x080492f0 <+56>:    push   0x804a059
+        0x080492f5 <+61>:    call   0x8049090 <scanf@plt>
+     => 0x080492fa <+66>:    add    esp,0x10
+        0x080492fd <+69>:    sub    esp,0x8
+        0x08049300 <+72>:    push   0x804a07f
+        0x08049305 <+77>:    lea    eax,[ebp-0x18]
+        0x08049308 <+80>:    push   eax
+        0x08049309 <+81>:    call   0x8049030 <strcmp@plt>
+        0x0804930e <+86>:    add    esp,0x10
+        0x08049311 <+89>:    test   eax,eax
+        0x08049313 <+91>:    jne    0x8049337 <main+127>
+        0x08049315 <+93>:    sub    esp,0xc
+        0x08049318 <+96>:    push   0x804a086
+        0x0804931d <+101>:   call   0x8049080 <puts@plt>
+        0x08049322 <+106>:   add    esp,0x10
+        0x08049325 <+109>:   sub    esp,0xc
+        0x08049328 <+112>:   push   0x804a095
+        0x0804932d <+117>:   call   0x80491f6 <print_key>
+        0x08049332 <+122>:   add    esp,0x10
+        0x08049335 <+125>:   jmp    0x8049347 <main+143>
+        0x08049337 <+127>:   sub    esp,0xc
+        0x0804933a <+130>:   push   0x804a0a4
+        0x0804933f <+135>:   call   0x8049080 <puts@plt>
+        0x08049344 <+140>:   add    esp,0x10
+        0x08049347 <+143>:   mov    eax,0x0
+        0x0804934c <+148>:   mov    ecx,DWORD PTR [ebp-0x4]
+        0x0804934f <+151>:   leave
+        0x08049350 <+152>:   lea    esp,[ecx-0x4]
+        0x08049353 <+155>:   ret
+        End of assembler dump.
+
+    ; please try reading (and understating) the code
+
+    ;   0x080492ec <+52>:    lea    eax,[ebp-0x18]
+    ;   0x080492ef <+55>:    push   eax
+    ;   0x080492f0 <+56>:    push   0x804a059
+    ;   0x080492f5 <+61>:    call   0x8049090 <scanf@plt>
+    ;    -> scanf("%s", buf), by the way that's the size of buf?
+
+    (gdb) x/1s 0x804a059
+    0x804a059:      "%s"
+
+    ; this is your input
+    (gdb) x/1s $ebp-0x18
+    0xffffcb30:     'a' <repeats 24 times>
+
+    ; please learn about the e[x]amine command ("help x"), which is
+    ; one of the most versatile commands in gdb
+
+    ;   0x08049300 <+72>:    push   0x804a07f
+    ;   0x08049305 <+77>:    lea    eax,[ebp-0x18]
+    ;   0x08049308 <+80>:    push   eax
+    ;   0x08049309 <+81>:    call   0x8049030 <strcmp@plt>
+    ;    -> strcmp(buf, "250381")
+
+    (gdb) x/1s 0x804a07f
+    0x804a07f:      "250381"
+
+    ;   0x08049311 <+89>:    test   eax,eax
+    ;   0x08049313 <+91>:    jne    0x8049337 <main+127>
+    ;   0x08049315 <+93>:    sub    esp,0xc
+    ;   0x08049318 <+96>:    push   0x804a086
+    ;   0x0804931d <+101>:   call   0x8049080 <puts@plt>
+    ;   ...
+    ;   0x08049335 <+125>:   jmp    0x8049347 <main+143>
+    ;   0x08049337 <+127>:   sub    esp,0xc
+    ;   0x0804933a <+130>:   push   0x804a0a4
+    ;   0x0804933f <+135>:   call   0x8049080 <puts@plt>
+
+    ; if (!strcmp(buf, "250381")) {
+    ;    printf("Password OK :)\n")
+    ;    ...
+    ; } else {
+    ;    printf("Invalid Password!\n");
+    ; }
+
+    (gdb) x/1s 0x804a0a4
+    0x804a0a4:      "Invalid Password!\n"
+    (gdb) x/1s 0x804a086
+    0x804a086:      "Password OK :)\n"
+
+So, try the password we found? Does it work? You can submit the flag
+to the submission site (see above) to get +20 points!
+
+
+3.2. crackme0x01
+----------------
+
+Let's go fast on this binary. Please take similar steps from
+crackme0x00 to reach this place.
+
+    (gdb) disas
+    Dump of assembler code for function main:
+        0x08049186 <+0>:     lea    ecx,[esp+0x4]
+        0x0804918a <+4>:     and    esp,0xfffffff0
+        0x0804918d <+7>:     push   DWORD PTR [ecx-0x4]
+        0x08049190 <+10>:    push   ebp
+        0x08049191 <+11>:    mov    ebp,esp
+        0x08049193 <+13>:    push   ecx
+        0x08049194 <+14>:    sub    esp,0x14
+        0x08049197 <+17>:    sub    esp,0xc
+        0x0804919a <+20>:    push   0x804a008
+        0x0804919f <+25>:    call   0x8049040 <puts@plt>
+        0x080491a4 <+30>:    add    esp,0x10
+        0x080491a7 <+33>:    sub    esp,0xc
+        0x080491aa <+36>:    push   0x804a020
+        0x080491af <+41>:    call   0x8049030 <printf@plt>
+        0x080491b4 <+46>:    add    esp,0x10
+        0x080491b7 <+49>:    sub    esp,0x8
+        0x080491ba <+52>:    lea    eax,[ebp-0xc]
+        0x080491bd <+55>:    push   eax
+        0x080491be <+56>:    push   0x804a02b
+        0x080491c3 <+61>:    call   0x8049050 <scanf@plt>
+
+    ; what's scanf() doing (i.e., what's the value of 0x804a02b)?
+
+     => 0x080491c8 <+66>:    add    esp,0x10
+        0x080491cb <+69>:    mov    eax,DWORD PTR [ebp-0xc]
+        0x080491ce <+72>:    cmp    eax,0xc8e
+
+    ; it compares eax (our input) with 0xc8e,
+    ; meaning that 0xc8e (hex? integer?) is the password.
+
+        0x080491d3 <+77>:    jne    0x80491e7 <main+97>
+        0x080491d5 <+79>:    sub    esp,0xc
+        0x080491d8 <+82>:    push   0x804a02e
+        0x080491dd <+87>:    call   0x8049040 <puts@plt>
+        0x080491e2 <+92>:    add    esp,0x10
+        0x080491e5 <+95>:    jmp    0x80491f7 <main+113>
+        0x080491e7 <+97>:    sub    esp,0xc
+        0x080491ea <+100>:   push   0x804a03d
+        0x080491ef <+105>:   call   0x8049040 <puts@plt>
+        0x080491f4 <+110>:   add    esp,0x10
+        0x080491f7 <+113>:   mov    eax,0x0
+        0x080491fc <+118>:   mov    ecx,DWORD PTR [ebp-0x4]
+        0x080491ff <+121>:   leave
+        0x08049200 <+122>:   lea    esp,[ecx-0x4]
+        0x08049203 <+125>:   ret
+
+So, try the password we found! Does it work? Great. Please explore all
+crackme binaries and if you think you are ready, please start the bomblab!

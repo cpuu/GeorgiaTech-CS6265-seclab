@@ -1,0 +1,975 @@
+# Tut09: Understanding Heap Bugs
+
+Now that everyone has well experienced the stack corruptions from the previous
+labs, from this lecture we will play with bugs on the heap, which are typically
+more complex than the stack-based ones.
+
+## Step 1. Revisiting a heap-based crackme0x00
+
+The **heap** space is the dynamic memory segment used by a process. Generally,
+we can allocate a heap memory object by `malloc()` and release it by `free()`
+when the resource is no longer needed. However, there are plenty of questions
+left to be answered, for example:
+- Do you know how these functions internally work on Linux?
+- Do you know where exactly the heap objects are located?
+- Do you know what are the heap-related bugs and how to exploit them?
+
+Do not worry if you don't, as you will get the answers to these questions
+if you follow through.
+
+Let's start our adventure with a new heap-based `crackme0x00`.
+
+```c
+char password[] = "250382";
+
+int main(int argc, char *argv[])
+{
+  setreuid(geteuid(), geteuid());
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stdin, NULL, _IONBF, 0);
+
+  char *buf = (char *)malloc(100);
+  char *secret = (char *)malloc(100);
+
+  strcpy(secret, password);
+
+  printf("IOLI Crackme Level 0x00\n");
+  printf("Password:");
+
+  scanf("%s", buf);
+
+  if (!strcmp(buf, secret)) {
+    printf("Password OK :)\n");
+  } else {
+    printf("Invalid Password! %s\n", buf);
+  }
+
+  return 0;
+}
+```
+
+You can see that now the input in `buf` is put on a piece of dynamic memory
+which has a size of 100. Meanwhile the `secret` of `250382` is also placed on
+the heap inside a memory block with the same size. 
+
+Our first task is to observe the exact memory location of these two heap
+objects. Let's check crackme0x00 in gdb.
+
+```sh
+(gdb) disassemble main
+Dump of assembler code for function main:
+   ...
+   0x80486b0 <main+106>:	call   0x80484c0 <malloc@plt>
+   0x80486b5 <main+111>:	add    esp,0x10
+   0x80486b8 <main+114>:	mov    DWORD PTR [ebp-0x20],eax
+   0x80486bb <main+117>:	sub    esp,0xc
+   0x80486be <main+120>:	push   0x64
+   0x80486c0 <main+122>:	call   0x80484c0 <malloc@plt>
+   0x80486c5 <main+127>:	add    esp,0x10
+   0x80486c8 <main+130>:	mov    DWORD PTR [ebp-0x1c],eax
+   0x80486cb <main+133>:	sub    esp,0x8
+   0x80486ce <main+136>:	lea    eax,[ebx+0x3c]
+   0x80486d4 <main+142>:	push   eax
+   0x80486d5 <main+143>:	push   DWORD PTR [ebp-0x1c]
+   0x80486d8 <main+146>:	call   0x80484b0 <strcpy@plt>
+   0x80486dd <main+151>:	add    esp,0x10
+   0x80486e0 <main+154>:	sub    esp,0xc
+   0x80486e3 <main+157>:	lea    eax,[ebx-0x1810]
+   0x80486e9 <main+163>:	push   eax
+   0x80486ea <main+164>:	call   0x80484d0 <puts@plt>
+   0x80486ef <main+169>:	add    esp,0x10
+   0x80486f2 <main+172>:	sub    esp,0xc
+   0x80486f5 <main+175>:	lea    eax,[ebx-0x17f8]
+   0x80486fb <main+181>:	push   eax
+   0x80486fc <main+182>:	call   0x8048490 <printf@plt>
+   0x8048701 <main+187>:	add    esp,0x10
+   0x8048704 <main+190>:	sub    esp,0x8
+   0x8048707 <main+193>:	push   DWORD PTR [ebp-0x20]
+   0x804870a <main+196>:	lea    eax,[ebx-0x17ee]
+   0x8048710 <main+202>:	push   eax
+   0x8048711 <main+203>:	call   0x8048510 <__isoc99_scanf@plt>
+   0x8048716 <main+208>:	add    esp,0x10
+   ...
+```
+
+From the assembly, we can see that the function `malloc()` is invoked for two
+times. As we are interested in its return value, let's set two breakpoints at the
+next following instructions, `0x80486b5` and `0x80486c5`, perspectively and start
+the program.
+
+```sh
+(gdb) b *0x80486b5
+Breakpoint 1 at 0x8048685: file crackme0x00.c, line 14.
+(gdb) b *0x80486c5
+Breakpoint 2 at 0x8048695: file crackme0x00.c, line 15.
+(gdb) r
+Starting program: tut09-heap/crackme0x00
+
+Breakpoint 1, 0x080486b5 in main (argc=1, argv=0xffb09244) at crackme0x00.c:14
+14    char *buf = (char *)malloc(100);
+```
+
+At `Breakpoint 1`, the program stops after returning from the first `malloc()`
+function. We can check the return value stored in register `eax`.
+
+```sh
+(gdb) i r eax
+eax            0x815f008  135655432
+```
+
+As you can see, `buf` points at `0x815f008` which will store our input.
+Note that you might see a different value in `eax` due to ASLR
+but it is totally fine. Let's continue the execution.
+
+```sh
+(gdb) c
+Continuing.
+
+Breakpoint 2, 0x080486c5 in main (argc=1, argv=0xffb09244) at crackme0x00.c:15
+15    char *secret = (char *)malloc(100);
+```
+
+The second `malloc()` returns. Similarly, we can find its return value stored in
+register `eax` as `0x815f070`.
+
+```sh
+(gdb) i r eax
+eax            0x815f070  135655536
+```
+
+Note that although the value might still be different from yours,
+it should have the consistent offset from the previous value across any runs
+(i.e., 0x815f070 - 0x815f008 = `0x68`). We can now take a look into these
+two memory locations.
+
+```sh
+(gdb) x/60wx 0x815f008 - 8
+0x815f000:  0x00000000  0x00000069  0x00000000  0x00000000
+0x815f010:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f020:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f030:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f040:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f050:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f060:  0x00000000  0x00000000  0x00000000  0x00000069
+0x815f070:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f080:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f090:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f0a0:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f0b0:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f0c0:  0x00000000  0x00000000  0x00000000  0x00000000
+0x815f0d0:  0x00000000  0x00020f31  0x00000000  0x00000000
+0x815f0e0:  0x00000000  0x00000000  0x00000000  0x00000000
+```
+
+Since we have not given our input and the program has not initialized
+the secret password, both of these heap objects are empty. However,
+you might be wondering at this moment: the returned address of the
+first heap object was `0x815f008`, and so why didn't it start
+from `0x815f000`? Where does that 8-byte offset come from?
+
+Let's first take a look at the memory layout of the process.
+
+```sh
+(gdb) info proc mappings
+process 5652
+Mapped address spaces:
+
+  Start Addr   End Addr       Size     Offset objfile
+   0x8048000  0x8049000     0x1000        0x0 /home/lab09/tut09-heap/crackme0x00
+   0x8049000  0x804a000     0x1000        0x0 /home/lab09/tut09-heap/crackme0x00
+   0x804a000  0x804b000     0x1000     0x1000 /home/lab09/tut09-heap/crackme0x00
+   0x815f000  0x8180000    0x21000        0x0 [heap]
+  0xf7d2e000 0xf7d2f000     0x1000        0x0 
+  0xf7d2f000 0xf7edf000   0x1b0000        0x0 /ubuntu_1604/lib/i386-linux-gnu/libc-2.23.so
+  0xf7edf000 0xf7ee1000     0x2000   0x1af000 /ubuntu_1604/lib/i386-linux-gnu/libc-2.23.so
+  0xf7ee1000 0xf7ee2000     0x1000   0x1b1000 /ubuntu_1604/lib/i386-linux-gnu/libc-2.23.so
+  0xf7ee2000 0xf7ee5000     0x3000        0x0 
+  0xf7eeb000 0xf7eec000     0x1000        0x0 
+  0xf7eec000 0xf7eef000     0x3000        0x0 [vvar]
+  0xf7eef000 0xf7ef1000     0x2000        0x0 [vdso]
+  0xf7ef1000 0xf7f14000    0x23000        0x0 /ubuntu_1604/lib/i386-linux-gnu/ld-2.23.so
+  0xf7f14000 0xf7f15000     0x1000    0x22000 /ubuntu_1604/lib/i386-linux-gnu/ld-2.23.so
+  0xf7f15000 0xf7f16000     0x1000    0x23000 /ubuntu_1604/lib/i386-linux-gnu/ld-2.23.so
+  0xffaea000 0xffb0b000    0x21000        0x0 [stack]
+```
+
+The `[heap]` label indicates the memory starting from `0x815f000` to
+`0x8180000` as the heap memory. While the first allocated heap
+object storing our input does not start from `0x815f000`, we can make an
+educational guess that the 8-byte offset, including the strange value of
+`0x69` at `0x815f004` is caused by the `libc` library.
+
+By simple calculation, since we first allocate for 100 bytes
+and `0x815f008 + 100 = 0x815f06c`, the memory space from `0x815f008`
+to `0x815f06c` is used to store the input. If the `libc` appends 8 bytes
+ahead of every allocated heap object and considering the returned address
+of the second heap object is `0x815f070`, then the 8 bytes starting at
+`0x815f070 - 8 = 0x815f068` should all belong to the second heap object.
+
+Most Linux distributions nowadays use `ptmalloc` as its `malloc`
+implementation in the libc. In the `ptmalloc`'s
+implementation, a memory object is called a `"chunk"` in libc. The following picture
+illustrates the exact structure of an allocated `"chunk"`.
+
+**In libc:**
+```c
+struct malloc_chunk {
+  INTERNAL_SIZE_T      mchunk_prev_size;  /* Size of previous chunk (if free).  */
+  INTERNAL_SIZE_T      mchunk_size;       /* Size in bytes, including overhead. */
+  struct malloc_chunk* fd;                /* double links -- used only if free. */
+  struct malloc_chunk* bk;
+  /* Only used for large blocks: pointer to next larger size.  */
+  struct malloc_chunk* fd_nextsize; /* double links -- used only if free. */
+  struct malloc_chunk* bk_nextsize;
+};
+
+typedef struct malloc_chunk* mchunkptr;
+```
+
+**Visualization:**
+```
+    chunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Size of previous chunk, if freed                | |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Size of chunk, in bytes                     |A|M|P|
+      mem-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             User data starts here...                          .
+            .                                                               .
+            .                                                               .
+            .                                                               |
+nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Size of chunk                                     |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Carefully check this picture and all your doubts can be solved:
+- `chunk` indicates the real starting address of the heap object in the memory.
+- `mem` indicates the returned address by `malloc()`, storing the user
+  data.
+The first 8-byte offset between `chunk` and `mem` is reserved for
+metadata which consist of the `size of previous chunk, if freed` and the 
+`size of the current chunk`. The latter is usually aligned to a multiple of 8
+and includes both the size of the metadata and the requested size from the program.
+
+Meanwhile, the first four bytes after `chunk` are a bit special. 
+There are two cases:
+- if the previous chunk is allocated, then these 4 bytes are used to store
+the data of the previous chunk.
+- otherwise, it is used to store the size of the previous chunk.
+That is why 100 + 8 = `108` while the libc only gives the chunk 0x69 - 1 = `104` bytes.
+Also, note that the three least significant bits (`LSB`) of the `size` field of a heap chunk
+have special meaning. Specifically, the last bit of the field indicates whether the previous
+chunk is in use (`1`) or not (`0`), and that's why the size field has `0x69` instead of `0x68`.
+**(Q: What's the usage of the other two bits?)**
+
+Let's continue the program and check the memory again. That will give you a
+better understanding of the illustration above. Set a breakpoint after `scanf()`
+and give our input.
+
+```sh
+(gdb) b *0x8048716
+Breakpoint 3 at 0x8048716: file crackme0x00.c, line 22.
+(gdb) c
+Continuing.
+IOLI Crackme Level 0x00
+Password:AAAABBBBCCCCDDDD
+
+Breakpoint 3, 0x08048716 in main (argc=1, argv=0xffb09244) at crackme0x00.c:22
+22    scanf("%s", buf);
+```
+
+And check the content inside these two heap objects.
+
+```sh
+(gdb) x/s 0x815f008
+0x815f008:  "AAAABBBBCCCCDDDD"
+(gdb) x/s 0x815f070
+0x815f070:  "250382"
+
+(gdb) x/60wx 0x804b000
+0x815f000:    0x00000000      0x00000069      0x41414141      0x42424242
+              prev_size       size            buf data -->
+0x815f010:    0x43434343      0x44444444      0x00000000      0x00000000
+0x815f020:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f030:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f040:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f050:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f060:    0x00000000      0x00000000      0x00000000      0x00000069
+                                            <-- buf data      size
+0x815f070:    0x33303532      0x00003238      0x00000000      0x00000000
+              secret data -->
+0x815f080:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f090:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f0a0:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f0b0:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f0c0:    0x00000000      0x00000000      0x00000000      0x00000000
+0x815f0d0:    0x00000000      0x00020f31      0x00000000      0x00000000
+         <-- secret data
+```
+
+Does it now make sense? `scanf()` reads our input `"AAAABBBBCCCCDDDD"`
+directly onto the heap without any size limit. And more importantly, the
+heap chunks are placed adjacently. Based on your former experience with stack
+overflows, it is not hard for you to corrupt the stored secret and pass the
+check at this moment, right? :)
+
+> **[NOTE]**: When ASLR is on, the heap base varies for every run. You can launch the
+> program for multiple times and check the heap base through `/proc/$(pidof crachme0x00)/maps`.
+
+```sh
+  // 1st run
+  $ cat /proc/$(pidof crackme0x00)/maps
+  08048000-08049000 r-xp 00000000 08:02 72746077 /home/lab09/tut09-heap/crackme0x00
+  08049000-0804a000 r--p 00000000 08:02 72746077 /home/lab09/tut09-heap/crackme0x00
+  0804a000-0804b000 rw-p 00001000 08:02 72746077 /home/lab09/tut09-heap/crackme0x00
+  0927f000-092a0000 rw-p 00000000 00:00 0        [heap]
+  ...
+
+  // 2nd run
+  $ cat /proc/$(pidof crackme0x00)/maps
+  08048000-08049000 r-xp 00000000 08:02 72746077 /home/lab09/tut09-heap/crackme0x00
+  08049000-0804a000 r--p 00000000 08:02 72746077 /home/lab09/tut09-heap/crackme0x00
+  0804a000-0804b000 rw-p 00001000 08:02 72746077 /home/lab09/tut09-heap/crackme0x00
+  09375000-09396000 rw-p 00000000 00:00 0        [heap]
+  ...
+```
+
+And it does not even tightly follow the address space of the process as shown in
+gdb when ASLR is off. However, we want to emphasize that for `ptmalloc`, the heap
+layout and the values of many meta data can be accurately inferred even tons of
+`malloc()` and `free()` have been called in a program.
+
+> **[Task]** Can you inject a payload to print out `Password OK :)`? Try
+> getting your flag from `target`!
+
+
+## Step 2. Examine the heap by using pwndbg
+
+Now we are going to explore more facts about the glibc heap with the help of
+pwndbg and the targeted example program is heap-example. Here is the code:
+
+```c
+void prompt(char *fmt, ...)
+{
+  va_list args;
+  
+  va_start(args, fmt);
+  vprintf(fmt, args);
+  va_end(args);
+
+  getchar();
+}
+
+int main()
+{
+  void *fb_0 = malloc(16);
+  void *fb_1 = malloc(32);
+  void *fb_2 = malloc(16);
+  void *fb_3 = malloc(32);
+  prompt("Stage 1");
+
+  free(fb_1);
+  free(fb_3);
+  prompt("Stage 2");
+
+  free(fb_0);
+  free(fb_2); 
+  malloc(32);
+  prompt("Stage 3");
+
+  void *nb_0 = malloc(100);
+  void *nb_1 = malloc(120);
+  void *nb_2 = malloc(140);
+  void *nb_3 = malloc(160);
+  void *nb_4 = malloc(180);
+  prompt("Stage 4");
+
+  free(nb_1);
+  free(nb_3); 
+  prompt("Stage 5");
+
+  void *nb_5 = malloc(240);
+  prompt("Stage 6");
+
+  free(nb_2);
+  prompt("Stage 7");
+ 
+  return 0;
+}
+```
+
+The program simply allocates some heap objects with various sizes and frees them
+accordingly. It is divided into several stages and at each stage, the
+program stops and we have a chance to look into the memory by using pwndbg heap commands.
+
+Let's launch the program in pwndbg and stop at **Stage 1** by using `Ctrl+C` to interrupt
+the execution. Enter command **arenas**:
+
+```sh
+$ gdb-pwndbg heap-example
+pwndbg> r
+Starting program: /home/lab09/tut09-heap/crackme0x00
+Stage 1^C
+Program received signal SIGINT, Interrupt.
+0xf7fd8059 in __kernel_vsyscall ()
+LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+...
+Program received signal SIGINT
+pwndbg> arenas
+[    main]    [0x804b000] 0x804b000  0x806c000 rw-p    21000 0      [heap]
+```
+
+The data structure used by `ptmalloc` to bookmark heap chunks are
+called `arena`. One arena is in charge of one process/thread heap.
+A process can have a lot of heaps simultaneously, and the arena of the initial heap
+is called the `main arena`, which points at `0x804b000` in this case.
+
+The program allocates 4 heap objects with size 16, 32, 16, 32 in order. We can
+type command **heap** to print a listing of all the chunks in the arena.
+
+```sh
+pwndbg> heap
+0x804b000 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b018 FASTBIN {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b040 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b058 FASTBIN {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b080 PREV_INUSE {
+  prev_size = 0, 
+  size = 1033, 
+  fd = 0x67617453, 
+  bk = 0x312065, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b488 PREV_INUSE {
+  prev_size = 0, 
+  size = 1033, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b890 PREV_INUSE {
+  prev_size = 0, 
+  size = 132977, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+```
+
+As we expect, the four heap chunks are placed **adjacently** in the memory.
+(Q: Why the sizes shown above are `25` and `41` respectively?) 
+
+We can see a very large heap chunk at the bottom that is not inuse, and 
+it has a special name called `top chunk`. You can visualize the heap layout 
+by command **vis_heap_chunks**.
+
+Continue the execution by entering anything you like for `getchar()`, and now we arrive
+at **Stage 2**, with the 2nd and 4th heap objects already freed. In `ptmalloc`, the freed chunks
+are stored into linked list-alike structures called `bins`. The chunk with
+size from 16~64 bytes (in 32-bit) belongs to the `fastbins`, which are singly
+linked lists. We can use command **fastbins** to have a check.
+
+```sh
+pwndbg> fastbins
+fastbins
+0x10: 0x0
+0x18: 0x0
+0x20: 0x0
+0x28: 0x804b058 -> 0x804b018 <- 0x0
+0x30: 0x0
+0x38: 0x0
+0x40: 0x0
+```
+
+Note that in a single fastbin, all the freed chunks have the same size. (Q: but their
+allocation sizes may differ, why?) 
+
+The heap chunk with a size of `40 (0x28)`
+belongs to the 3rd fastbin, while the head of the linked list is
+pointing to our 4th heap chunk and the 4th heap chunk points to the 2nd one. Pay
+attention to the order of these chunk in the linked list. In fact, the chunk is
+inserted at the HEAD of its corresponding fastbin.
+
+We can use pwndbg to print out the memory detail of a heap chunk. We take the
+2nd heap chunk as an example.
+
+```sh
+pwndbg> p *(mchunkptr) 0x804b018
+$1 = {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+```
+
+We have explained what is `prev_size` and what is `size` above. (Why the `prev_size`
+is 0 here?). When a chunk is freed, the first 16 bytes of its data storage are no
+longer used to store user data. Instead, they are used to store pointers pointing forward
+and backward to the chunks in the same bin. Here `fd` stores the pointer
+pointing to the 2nd heap chunk in the 3rd fastbin. The `bk` pointer, however, is not used
+as the fastbin is a single linked list. You can also print out the detail of
+the 4th heap chunk.
+
+Continue the execution and we arrive at **Stage 3**. This time all the heap
+objects we have initially allocated are freed. Issue command **fastbins** to have a
+check.
+
+```sh
+pwndbg> fastbins
+fastbins
+0x10: 0x0
+0x18: 0x804b040 -> 0x804b000 <- 0x0
+0x20: 0x0
+0x28: 0x804b018 <- 0x0
+0x30: 0x0
+0x38: 0x0
+0x40: 0x0
+```
+
+With a smaller size, the 1st chunk and the 3rd chunk are placed into the 1st
+fastbin. Print out the memory details of these two heap chunks as above, and make sure
+that you understand each field value before continuing. Try to print out the list of
+all the heap chunks again by using command **heap**.
+
+```sh
+pwndbg> heap
+0x804b000 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b018 FASTBIN {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b040 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x804b000, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b058 FASTBIN {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x804b018, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+```
+
+Note that the sizes of the chunks indicate that they are still inuse
+(Q: Why? The inuse bit is 1!).
+The reason is that when a heap chunk is freed and stored into the fastbin, the 
+`LSB` of the `size` field of its next chunk is not cleared.
+
+As we also issued another `malloc(32)` in this stage, let's check the status of
+the fastbins again by using command **fastbins**.
+
+```sh
+pwndbg> fastbins
+fastbins
+0x10: 0x0
+0x18: 0x804b040 -> 0x804b000 <- 0x0
+0x20: 0x0
+0x28: 0x804b018 <- 0x0
+0x30: 0x0
+0x38: 0x0
+0x40: 0x0
+```
+
+You can see that the freed chunk at `0x804b058` is used to serve the allocation
+request. In another word, the fastbin works in a `LIFO (Last-In-First-Out)` style.
+
+Let's allocate some heap chunks whose sizes are out of the fastbin range.
+Continue the execution and we now arrive at **Stage 4**. Another 5 heap objects with
+size of 100, 120, 140, 160, 180 are allocated by calling `malloc()`. Use command
+**heap** to print out the chunk list.
+
+```sh
+pwndbg> heap
+0x804b000 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b018 FASTBIN {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+0x804b890 PREV_INUSE {
+  prev_size = 0, 
+  size = 105, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b8f8 PREV_INUSE {
+  prev_size = 0, 
+  size = 129, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b978 PREV_INUSE {
+  prev_size = 0, 
+  size = 145, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804ba08 PREV_INUSE {
+  prev_size = 0, 
+  size = 169, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804bab0 PREV_INUSE {
+  prev_size = 0, 
+  size = 185, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804bb68 PREV_INUSE {
+  prev_size = 0, 
+  size = 132249, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+```
+
+We can see that the 5 new heap chunks are created on the heap one by one following
+the order of `malloc()` being called. (Q: Why we have these chunk sizes here?)
+Let's print out the 3rd new chunk as an example.
+
+```sh
+pwndbg> p *(mchunkptr) 0x804b978
+$1 = {
+  prev_size = 0, 
+  size = 145, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+```
+
+Moving forward to **Stage 5**, the 2nd and the 4th (in term of those
+bigger chunks we allocate later) heap chunks are de-allocated.
+Try command **heap** to print out the chunk list.
+
+```sh
+pwndbg> heap
+0x804b000 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b018 FASTBIN {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+0x804b890 PREV_INUSE {
+  prev_size = 0, 
+  size = 105, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b8f8 PREV_INUSE {
+  prev_size = 0, 
+  size = 129, 
+  fd = 0xf7fc97b0 <main_arena+48>, 
+  bk = 0x804ba08, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b978 {
+  prev_size = 128, 
+  size = 144, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804ba08 PREV_INUSE {
+  prev_size = 0, 
+  size = 169, 
+  fd = 0x804b8f8, 
+  bk = 0xf7fc97b0 <main_arena+48>, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804bab0 {
+  prev_size = 168, 
+  size = 184, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+```
+
+When these heap chunks are freed, they are in fact recycled into the `unsorted
+bin`. Unlike the `fastbins`, chunks inside this bin can have various sizes. And more
+importantly, the `unsorted bin` is a cyclic double linked list. Take a look at
+the above result, we can find that the 2nd chunk has a backward pointer pointing
+to the 4th chunk and the 4th chunk has a forward pointer pointing to the 2nd
+chunk. The head chunk of the `unsorted bin` is at `0xf7fc97b0`. Pay attention to the
+order of these two chunks in the bin.
+
+We can print out the memory detail of the freed chunk for more information. Take
+the 2nd one at `0x804b8f8` as an example.
+
+```sh
+pwndbg> p *(mchunkptr) 0x804b8f8
+$1 = {
+  prev_size = 0, 
+  size = 129, 
+  fd = 0xf7fc97b0 <main_arena+48>, 
+  bk = 0x804ba08, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+```
+
+Try to take a look at the 3rd chunk after the 2nd chunk at `0x804b978`.
+
+```sh
+pwndbg> malloc_chunk 0x804b978
+0x804b978 {
+  prev_size = 128, 
+  size = 144, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+```
+
+Why is the size `144(0x90)` now? And why does the `prev_size` become `128(0x80)`?
+
+If you are good with everything so far, we can move forward to **Stage 6**. This
+time we allocate a new heap object with size 240. Let's print out the chunk list
+first,
+
+```sh
+pwndbg> heap
+0x804b000 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b018 FASTBIN {
+  prev_size = 0, 
+  size = 41, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+0x804b890 PREV_INUSE {
+  prev_size = 0, 
+  size = 105, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b8f8 PREV_INUSE {
+  prev_size = 0, 
+  size = 129, 
+  fd = 0xf7fc9828 <main_arena+168>, 
+  bk = 0xf7fc9828 <main_arena+168>, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b978 {
+  prev_size = 128, 
+  size = 144, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804ba08 PREV_INUSE {
+  prev_size = 0, 
+  size = 169, 
+  fd = 0xf7fc9850 <main_arena+208>, 
+  bk = 0xf7fc9850 <main_arena+208>, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804bab0 {
+  prev_size = 168, 
+  size = 184, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804bb68 PREV_INUSE {
+  prev_size = 0, 
+  size = 249, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+```
+
+As expected, a new heap chunk with chunk size `248(0xf8)` is generated. However, it
+seems that the freed 2nd and 4th chunk are not in the `unsorted bin` any longer.
+One is linked into a new linked list with the head node at `0xf7fc9828`, and the
+other one is linked into another linked list which has the head node at
+`0xf7fc9850`. You can also print out the detail of these two chunks to get more
+information.
+
+So what happened? In fact, when a new `malloc` request comes, the `unsorted bin` is
+traversed (fastbins are skipped due to size constraint) to find out a proper freed chunk.
+However, both the 2nd chunk and the 4th chunk cannot satisfy the request size.
+So they are unlinked from the `unsorted bin`, and then inserted into their
+corresponding `smallbin`. We can use command **smallbins** to check that.
+
+```sh
+pwndbg> smallbins
+smallbins
+0x80: 0x804b8f8 -> 0xf7fc9828 (main_arena+168) <- 0x804b8f8
+0xa8: 0x804ba08 -> 0xf7fc9850 (main_arena+208) <- 0x804ba08
+```
+
+Note that different from the `unsorted bin`, the chunks in the same `smallbin` have
+the same size, but it is also a cyclic double linked list. (The number inside the
+parentheses is the chunk size).
+
+Finally, we arrive at **Stage 7**. This time we de-allocate the 3rd chunk
+in between the freed 2nd and 4th chunk, and then list out all the heap chunks.
+
+```sh
+pwndbg> heap
+0x804b000 FASTBIN {
+  prev_size = 0, 
+  size = 25, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+0x804b890 PREV_INUSE {
+  prev_size = 0, 
+  size = 105, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804b8f8 PREV_INUSE {
+  prev_size = 0, 
+  size = 441, 
+  fd = 0xf7fc97b0 <main_arena+48>, 
+  bk = 0xf7fc97b0 <main_arena+48>, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+0x804bab0 {
+  prev_size = 440, 
+  size = 184, 
+  fd = 0x0, 
+  bk = 0x0, 
+  fd_nextsize = 0x0, 
+  bk_nextsize = 0x0
+}
+...
+```
+
+Surprisingly, you can see that those three freed chunks are consolidated into a
+new big chunk. It will used to serve for the allocation request in the future.
+
+## Reference
+
+- [Educational Heap Exploitation](https://github.com/shellphish/how2heap)
+- [Heap Exploitation by Dhaval (former student)](https://heap-exploitation.dhavalkapil.com/)
+- [A Memory Allocator](http://gee.cs.oswego.edu/dl/html/malloc.html)
+- [Phrack magazine on malloc](http://phrack.org/issues/57/8.html)
+- [Exploiting the heap](http://www.win.tue.nl/~aeb/linux/hh/hh-11.html)
+- [Understanding the Heap & Exploiting Heap Overflows](http://www.mathyvanhoef.com/2013/02/understanding-heap-exploiting-heap.html)
+- [The Shellcoder's Handbook: Discovering and Exploiting Security Holes, p89-107](https://goo.gl/vMXBn7)
+- [The Malloc Maleficarum](https://packetstormsecurity.com/files/40638/MallocMaleficarum.txt.html)
+- [Frontlink Arbitrary Allocation](https://github.com/Scepticz/Glibc-Malloc-POCs/blob/master/frontlink_arbitrary_allocation.c)

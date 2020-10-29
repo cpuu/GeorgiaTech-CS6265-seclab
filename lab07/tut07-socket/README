@@ -1,0 +1,243 @@
+# Tut07: Socket Programming in Python
+
+In this tutorial, we are going to learn about the basic socket
+programming in Python and techniques required for remote exploitation.
+
+## Step 1. `nc` command
+
+The netcat command, shortly `nc`, is similar to the cat command, but for
+networking. The good-old-day nc (called ncat in today's distribution)
+is much versatile (check it out if you want).
+
+Here is a simple demonstration of how to use nc:
+
+```
+(console 1)
+$ nc -l 1234
+(listen on the 1234 port)
+
+(console 2)
+$ nc localhost 1234
+```
+
+`nc [address] [port]` command gets you connected to the server,
+which is running at the given `address` and `port`.
+(FYI, localhost is an alias of 127.0.0.1, which is a reserved IP address
+ of your own computer.)
+
+Now, type "hello" and hit <enter> in console 2:
+
+```
+(console 2)
+$ nc localhost 1234
+hello
+
+(console 1)
+$ nc -l 1234
+hello
+```
+
+Did you get "hello" message in console 1?
+What about typing "world" in console 2?
+
+You've just created a nice chat program! You can talk to your fellow in
+our server :)
+
+
+## Step 2. Rock, Paper, Scissor
+
+Today's goal is to beat computer in a rock-paper-scissors game!
+
+```
+$ make
+$ ./target 1234
+```
+
+In another console, try to connect to the target server using `nc`:
+
+```
+$ nc localhost 1234
+Let's play rock, paper, scissor!
+Your name> 
+```
+
+Similarly, you can connect to a remote server.
+
+```
+$ nc [LAB_SERVER_IP] 10700
+```
+
+Do you want to explore the program a bit?
+
+```
+$ nc localhost 1234
+Let's play rock, paper, scissor!
+Your name> cs6265
+Your turn> rock
+You lose! Game over
+```
+
+You have to win 5 times in a row to win the game, which means the odds are
+not TOO bad for brute forcing.
+
+
+### 2.1. Socket Programming in Python
+
+Let's use pwntool for socket operation. The following code snippet
+opens a socket (on port 1234), and reads from or writes to it:
+
+```py
+from pwn import *
+
+s = remote("localhost", 1234)
+s.send(s.recv(10))
+s.close()
+```
+
+We provide a template code to help you write a socket client code
+in python.
+
+```
+(console 1)
+$ ./target
+
+(console 2)
+$ ./exploit.py
+```
+
+> **[Task]** Your first task is to understand the template and write a code that
+> brute forces the target server!
+> 
+> e.g., any chance to win by playing only "rock" for five (or more) times?
+> 
+> You have a pretty high chance of winning (1/3^5 = 1/243!).
+
+
+### 2.2. Timing Attack against the Remote Server!
+
+Brute forcing is dumb, so be smart in exploitation.
+
+In the target.c, this part is the most interesting for us:
+
+```c
+void start(int fd) {
+
+  write(fd, "Let's play rock, paper, scissors!\nYour name> ", 44);
+
+  char name[0x200];
+  if (read_line(fd, name, sizeof(name) - 1) <= 0) {
+    return;
+  }
+
+  srand(*(unsigned int*)name + time(NULL));
+
+  int iter;
+  for (iter = 0; iter < 5; iter ++) {
+
+    write(fd, "Your turn> ", 11);
+
+    char input[10];
+    if (read_line(fd, input, sizeof(input) - 1) <= 0) {
+      return;
+    }
+
+    int yours = convert_to_int(input);
+    if (yours == -1) {
+      write(fd, "Not recognized! You lost!\n", 26);
+      return;
+    }
+
+    int r = rand();
+    int result = yours - r % 3;
+    if (result == 0) {
+      write(fd, "Tie, try again!\n", 16);
+      iter --;
+      continue;
+    }
+    if (result == 1 || result == -2) {
+      write(fd, "You win! try again!\n", 20);
+    } else {
+      write(fd, "You lose! Game over\n", 20);
+      return;
+    }
+  }
+
+  write(fd, "YOU WIN!\n", 9);
+  dump_flag(fd);
+}
+```
+
+Did you notice the use of srand + name as a seed for the game?
+
+```c
+srand(*(unsigned int*)name + time(NULL));
+```
+
+Since the name variable is what you've provided and the time is
+predictable, you can abuse this information to win the match all the
+time! (dreaming of winning jackpots all the time ..)
+
+There are two things you need to know in Python.
+
+
+#### 1) Invoking a C function
+
+ref. <https://docs.python.org/2/library/ctypes.html>
+
+```py
+from ctypes import *
+
+# how to invoke a C function in Python
+libc = cdll.LoadLibrary("libc.so.6")
+libc.printf("hello world!\n")
+```
+
+This is how you invoke a 'printf' function in Python. How would you invoke
+`srand()`/`rand()`?
+
+
+#### 2) Packing
+
+To cast a C string to an unsigned int, you need to know how to
+`'unpack'` in Python (i.e., unpacking a string to get an unsigned int).
+
+ref. <https://docs.python.org/2/library/struct.html>
+
+```py
+struct.unpack("<I", "test")
+```
+
+The `"<I"` magic code needs an explanation: `"<"` means 'little endian' and
+`"I"` stands for 'unsigned int'.
+
+In this case, string `"test"` is being type-casted to this unsigned integer:
+
+```py
+(ord('t') << 24) + (ord('s') << 16) + (ord('e') << 8) + ord('t')
+```
+
+Also, you can use a built-in function `u32` from pwntools:
+
+```py
+from pwn import *
+x = struct.unpack("<I", "test") # x becomes (1953719668, )
+y = u32("test")                 # y becomes 1953719668
+assert(x[0] == y)               # x[0] and y are the same!
+```
+
+If you understand 1) and 2), you are ready to beat the computer.
+First, try to guess the `rand()` output of the target,
+and send the winning shot every time.
+
+Once you win the game, don't forget to dump the flag from our server:
+
+```sh
+$ nc [LAB_SERVER_IP] 10700
+```
+
+> **[Task]** Guess the output of `rand()` of the target.
+> Send the winning shot five times in a row to defeat the computer,
+> and read the printed flag to submit.
+
+Good luck!
+

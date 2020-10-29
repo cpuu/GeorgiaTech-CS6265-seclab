@@ -1,0 +1,286 @@
+# Tut04: Bypassing Stack Canaries
+
+In this tutorial, we will explore a defense mechanism against
+stack overflows, namely the stack canary. It is indeed
+the most primitive form of defense, yet powerful and performant,
+so very popular in most, if not all, binaries
+you can find in modern distributions. The lab challenges showcase
+a variety of designs of stack canaries, and highlight their subtle
+pros and cons in various target applications.
+
+## Step 0. Revisiting "crackme0x00"
+
+This is the original source code of the crackme0x00 challenge
+that we are quite familiar with:
+
+```c
+$ cat crackme0x00.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main(int argc, char *argv[])
+{
+  setreuid(geteuid(), geteuid());
+  char buf[16];
+  printf("IOLI Crackme Level 0x00\n");
+  printf("Password:");
+
+  scanf("%s", buf);
+
+  if (!strcmp(buf, "250382"))
+    printf("Password OK :)\n");
+  else
+    printf("Invalid Password!\n");
+
+  return 0;
+}
+```
+
+We are going to compile this source code into four different binaries
+with the following options:
+
+```sh
+$ make
+cc -m32 -g -O0 -mpreferred-stack-boundary=2 -no-pie -fno-stack-protector -z execstack -o crackme0x00-nossp-exec crackme0x00.c
+checksec --file crackme0x00-nossp-exec
+[*] '/tmp/.../tut04-ssp/crackme0x00-nossp-exec'
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX disabled
+    PIE:      No PIE (0x8048000)
+    RWX:      Has RWX segments
+cc -m32 -g -O0 -mpreferred-stack-boundary=2 -no-pie -fno-stack-protector -o crackme0x00-nossp-noexec crackme0x00.c
+checksec --file crackme0x00-nossp-noexec
+[*] '/tmp/.../tut04-ssp/crackme0x00-nossp-noexec'
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+cc -m32 -g -O0 -mpreferred-stack-boundary=2 -no-pie -fstack-protector -o crackme0x00-ssp-exec -z execstack crackme0x00.c
+checksec --file crackme0x00-ssp-exec
+[*] '/tmp/.../tut04-ssp/crackme0x00-ssp-exec'
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX disabled
+    PIE:      No PIE (0x8048000)
+    RWX:      Has RWX segments
+cc -m32 -g -O0 -mpreferred-stack-boundary=2 -no-pie -fstack-protector -o crackme0x00-ssp-noexec crackme0x00.c
+checksec --file crackme0x00-ssp-noexec
+[*] '/tmp/.../tut04-ssp/crackme0x00-ssp-noexec'
+    Arch:     i386-32-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x8048000)
+```
+
+There are a few interesting compilation options that we used:
+
+1. `-fno-stack-protector`: do not use a stack smashing protector
+2. `-z execstack`: make its stack **"executable"**
+
+So we name each binary with the following convention:
+
+```
+crackme0x00-{ssp|nossp}-{exec|noexec}
+```
+
+## Step 1. Let's crash the "crackme0x00" binary
+
+`crackme0x00-nossp-exec` behaves exactly same as `crackme0x00`. Not
+surprisingly, it crashes with a long input:
+
+```sh
+$ echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | ./crackme0x00-nossp-exec
+IOLI Crackme Level 0x00
+Password:Invalid Password!
+Segmentation fault
+```
+
+What about `crackme0x00-ssp-exec` compiled with a stack smashing protector?
+
+```sh
+$ echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | ./crackme0x00-ssp-exec
+IOLI Crackme Level 0x00
+Password:Invalid Password!
+*** stack smashing detected ***: <unknown> terminated
+Aborted
+```
+
+The **"stack smashing"** is detected so the binary simply prevents itself
+from an exploitation; resulting in a crash instead of being hijacked.
+
+You might want to run `gdb` to figure out what's going on with this binary:
+
+```sh
+$ gdb  ./crackme0x00-ssp-noexec
+Reading symbols from ./crackme0x00-ssp-noexec...done.
+(gdb) r
+Starting program: crackme0x00-ssp-noexec
+IOLI Crackme Level 0x00
+Password:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Invalid Password!
+*** stack smashing detected ***: <unknown> terminated
+
+Program received signal SIGABRT, Aborted.
+0xf7fd5079 in __kernel_vsyscall ()
+(gdb) bt
+#0  0xf7fd5079 in __kernel_vsyscall ()
+#1  0xf7e14832 in __libc_signal_restore_set (set=0xffffd1d4) at ../sysdeps/unix/sysv/linux/nptl-signals.h:80
+#2  __GI_raise (sig=6) at ../sysdeps/unix/sysv/linux/raise.c:48
+#3  0xf7e15cc1 in __GI_abort () at abort.c:79
+#4  0xf7e56bd3 in __libc_message (action=do_abort, fmt=<optimized out>) at ../sysdeps/posix/libc_fatal.c:181
+#5  0xf7ef0bca in __GI___fortify_fail_abort (need_backtrace=false, msg=0xf7f677fa "stack smashing detected") at fortify_fail.c:33
+#6  0xf7ef0b7b in __stack_chk_fail () at stack_chk_fail.c:29
+#7  0x080486e4 in __stack_chk_fail_local ()
+#8  0x0804864e in main (argc=97, argv=0xffffd684) at crackme0x00.c:21
+```
+
+
+## Step 2. Let's analyze!
+
+To help you figure out how two binaries are different,
+we (so kind!) provide you with a script, `./diff.sh`
+that compares two binaries and shows the differences.
+
+```diff
+$ ./diff.sh crackme0x00-nossp-noexec crackme0x00-ssp-noexec
+--- /dev/fd/63  2019-09-16 16:31:16.066674521 -0500
++++ /dev/fd/62  2019-09-16 16:31:16.066674521 -0500
+@@ -3,38 +3,46 @@
+        mov    ebp,esp
+        push   esi
+        push   ebx
+-       sub    esp,0x10
+-       call   0x8048480 <__x86.get_pc_thunk.bx>
+-       add    ebx,0x1aad
+-       call   0x80483d0 <geteuid@plt>
++       sub    esp,0x18
++       call   0x80484d0 <__x86.get_pc_thunk.bx>
++       add    ebx,0x1a5d
++       mov    eax,DWORD PTR [ebp+0xc]
++       mov    DWORD PTR [ebp-0x20],eax
++       mov    eax,gs:0x14
++       mov    DWORD PTR [ebp-0xc],eax
++       xor    eax,eax
++       call   0x8048420 <geteuid@plt>
+        mov    esi,eax
+
+
+...
+        add    esp,0x4
+        mov    eax,0x0
++       mov    edx,DWORD PTR [ebp-0xc]
++       xor    edx,DWORD PTR gs:0x14
++       call   0x80486d0 <__stack_chk_fail_local>
+        pop    ebx
+        pop    esi
+        pop    ebp
+```
+
+Two notable differences are at the function prologue and the epilogue.
+In the ssp-enabled binary, there is an extra value (`%gs:0x14`)
+placed right after the frame pointer on the stack:
+
+```diff
++       mov    eax,gs:0x14
++       mov    DWORD PTR [ebp-0xc],eax
++       xor    eax,eax
+```
+
+And the binary validates if the inserted value remains the same
+right before the function returns to its caller:
+
+```diff
++       mov    edx,DWORD PTR [ebp-0xc]
++       xor    edx,DWORD PTR gs:0x14
++       call   0x7c0 <__stack_chk_fail_local>
+```
+
+`__stack_chk_fail_local()` is the function you observed in the gdb's backtrace.
+
+
+## Step 3. Stack Canary
+
+This extra value is called, **"canary"** (a bird, umm why?). More
+precisely, what are these values?
+
+```sh
+$ gdb ./crackme0x00-ssp-exec
+(gdb) br *0x0804863d
+(gdb) r
+...
+(gdb) x/1i $eip
+=> 0x0804863d <main+167>: mov    edx,DWORD PTR [ebp-0xc]
+(gdb) si
+(gdb) info r edx
+edx            0xcddc8000 -841187328
+
+(gdb) r
+...
+(gdb) x/1i $eip
+=> 0x0804863d <main+167>: mov    edx,DWORD PTR [ebp-0xc]
+(gdb) si
+(gdb) info r edx
+edx            0xe4b8800  239831040
+```
+
+Did you notice the canary value changes whenever you run the binary?
+This is great because attackers have to guess the canary value
+before each exploitation attempt in order to bypass the stack protection
+mechanism.
+
+
+## Step 4. Bypassing Stack Canary
+
+However, what if the stack canary implementation is not "perfect",
+meaning that an attacker might be able to guess the value
+(i.e., `%gs:0x14`)?
+
+Let's check out `target-ssp` binary:
+
+```sh
+$ objdump -M intel -d ./target-ssp
+...
+```
+
+A stronger (better) canary implementation would use
+a randomly generated (`gs:0x14`) value as a canary like the following:
+```x86asm
+mov    eax,gs:0x14
+mov    DWORD PTR [ebp-0xc],eax
+xor    eax,eax
+```
+
+However, the target binary's implementation uses
+a _known_ value (i.e., `0xdeadbeef`) as a stack canary:
+
+```x86asm
+mov    DWORD PTR [ebp-0xc],0xdeadbeef
+```
+
+So, the stack should be like:
+
+```
+             |<-- 0x1c -------------------->|+--- ebp
+  top                                v
+  [          [              ][canary][unused][fp][ra][      ....]
+  |<----   0x38  -------------------------->|
+```
+
+> **[Task]** How could we exploit this program, like the last week's tutorial,
+> and get the flag?
+
+
+## Reference
+
+- [Buffer Overflow Protection](https://en.wikipedia.org/wiki/Buffer_overflow_protection)
+- [Bypassing Stackguard and StackShield](http://phrack.org/issues/56/5.html)
+- [Four Different Tricks to Bypass StackShield and StackGuard Protection](https://www.coresecurity.com/sites/default/private-files/publications/2016/05/StackguardPaper.pdf)
+

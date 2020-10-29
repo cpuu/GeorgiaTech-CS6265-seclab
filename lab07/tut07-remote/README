@@ -1,0 +1,14 @@
+ Lab07: tut07-remote
+====================
+
+   A warm-up tutorial.
+
+ - target    : target-seccomp
+ - type      : INETD
+ - arch      : 64
+ - level     : 3
+ - points    : 20
+ - uid       : 27003
+ - release   : 03-06-2020 00:00:00
+ - deadline  : 10-16-2020 00:00:00
+ - hashval   : 5594166B

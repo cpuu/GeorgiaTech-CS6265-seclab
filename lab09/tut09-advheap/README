@@ -1,0 +1,476 @@
+# Tut09: Exploiting Heap Allocators
+
+## Freed heap chunk
+
+Revisiting the `struct malloc_chunk` allocated by `malloc()`:
+
+@img(w75%, img/heap/heap.svg, Layout of malloc_chunk in heap.)
+
+When `malloc()` is called, `ptr` pointing at the start of the usable payload
+section is returned, while the previous bytes store metadata information.
+When the allocated chunk is freed by calling `free(ptr)`, as we have experienced
+from the previous steps, the first 16 bytes of the payload section are used as
+`fd` and `bk`.
+
+A more detailed view of a freed chunk:
+```
+    chunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Size of previous chunk, if unallocated (P clear)  |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    `head:' |             Size of chunk, in bytes                     |A|0|P|
+      mem-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Forward pointer to next chunk in list             |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Back pointer to previous chunk in list            |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Unused space (may be 0 bytes long)                .
+            .                                                               .
+            .                                                               |
+nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    `foot:' |             Size of chunk, in bytes                           |
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            |             Size of next chunk, in bytes                |A|0|0|
+            +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+> **[NOTE]**: Free chunks are maintained in a **circular doubly linked list**
+> by `struct malloc_state`.
+
+Now let's take a look at some interesting heap management mechanisms we can
+abuse to exploit heap.
+
+## Unsafe unlink
+
+The main idea of this technique is to trick `free()` to unlink the second chunk
+(`p2`) from free list so that we can achieve arbitrary write.
+
+@img(w75%, img/heap/heap-unlink.svg, Heap unsafe unlink attack.)
+
+When `free(p1)` is called, `_int_free(mstate av, mchunkptr p, int have_lock)`
+is actually invoked and frees the first chunk. Several checks are applied
+during this process, which we will not go into details here, but you will be
+asked to bypass some of them in the lab challenges ;)
+
+The key step during the `free(p1)` operation is when the freed chunk is put
+back to unsorted bin *(think of unsorted bin as a cache to speed up allocation
+and deallocation requests)*. The chunk will first be merged with
+neighboring free chunks in memory, called **consolidation**, then added to the
+unsorted bin as a larger free chunk for future allocations.
+
+Three important phases:
+
+1. **Consolidate backward**
+
+    If previous chunk in memory is not in use (`PREV_INUSE (P) == 0`),
+    `unlink` is called on the previous chunk to take it off the free list.
+    The previous chunk's size is then added to the current size, and the current
+    chunk pointer points to the previous chunk.
+
+2. **Consolidate forward** (in the figure)
+
+    If next chunk (`p2`) in memory is not the top chunk and not in use, **confirmed by
+    next-to-next chunk’s `PREV_INUSE (P)` bit is unset (`PREV_INUSE (P) == 0`)**,
+    `unlink` is called on the next chunk (`p2`) to take it off the free list.
+    To navigate to next-to-next chunk, add both the current chunk's (`p1`) size
+    and the next chunk's (`p2`) size to the current chunk pointer.
+
+3.  Finally the consolidated chunk is added to the unsorted bin.
+
+The interesting part comes from the unlink process:
+
+```c
+#define unlink(P, BK, FD)
+{
+    FD = P->fd;
+    BK = P->bk;
+    FD->bk = BK;
+    BK->fd = FD;
+}
+```
+
+`unlink` is a macro defined to remove a victim chunk from a bin. Above is a
+simplified version of `unlink`. Essentially it is adjusting the `fd` and `bk`
+of neighboring chunks to take the victim chunk (`p2`) off the free list by
+`P->fd->bk = P->bk` and `P->bk->fd = P->fd`.
+
+If we think carefully, the attacker can craft the `fd` and `bk` of the second
+chunk (`p2`) and achieve arbitrary write when it's unlinked. Here is how this
+can be performed.
+
+Let's first break down the above `unlink` operation from the pure C language's
+point of view. Assuming 32-bit architecture, we get:
+
+```c
+BK = *(P + 12);
+FD = *(P + 8);
+*(FD + 12) = BK;
+*(BK + 8) = FD;
+```
+
+Resulting in:
+
+1. The memory at `FD+12` is overwritten with `BK`.
+
+2. The memory at `BK+8` is overwritten with `FD`.
+
+**Q: What if we can control `BK` and `FD`?**
+
+Assume that we can overflow the first chunk (`p1`) freely into the second
+chunk (`p2`). In such case, we are free to put any value to `BK` and `FD` of
+the second chunk (`p2`).
+
+We can achieve arbitrary writing of `malicious_addr` to `target_addr` by
+simply:
+
+1. Changing `FD` of the second chunk (`p2`) to our `target_addr-12`
+
+2. Changing `BK` of the second chunk (`p2`) to our `malicious_addr`
+
+Isn't it just amazing? :)
+
+However, life is not easy. To achieve this, the second chunk (`p2`) has
+to be free, **confirmed by the third chunk’s `PREV_INUSE (P)` bit is unset
+(`PREV_INUSE (P) == 0`)**. Recall that during unlink consolidation phase, we
+navigate to the next chunk by adding the current chunk's size to its chunk
+pointer. In `malloc.c`, it is checked in `_int_free (mstate av, mchunkptr p,
+int have_lock)`:
+
+```c
+/* check/set/clear inuse bits in known places */
+#define inuse_bit_at_offset(p, s)               \
+  (((mchunkptr) (((char *) (p)) + (s)))->size & PREV_INUSE)
+...
+static void
+_int_free (mstate av, mchunkptr p, int have_lock)
+{
+  nextsize = chunksize(nextchunk);
+  ...
+  if (nextchunk != av->top) {
+      /* get and clear inuse bit */
+      nextinuse = inuse_bit_at_offset(nextchunk, nextsize);
+
+      /* consolidate forward */
+      if (!nextinuse) {
+        unlink(av, nextchunk, bck, fwd);
+        size += nextsize;
+      } else
+        clear_inuse_bit_at_offset(nextchunk, 0);
+  ...
+}
+```
+
+> **[TASK]**: Can you trick `free()` to think the second chunk (`p2`) is free?
+
+Here is how we can achieve it while overflowing the first chunk (`p1`):
+
+1. Set size of `nextchunk` to `-sizeof(void*)` (`-4` in 32-bit arch).
+Note that it also achieves `PREV_INUSE (P) == 0` in this case.
+
+2. Set size of previous chunk to `0`.
+
+Therefore, `inuse_bit_at_offset(p, s)` will get the address of the third chunk
+by adding `-4` bytes to the second chunk's (`p2`) address, which will return
+the second chunk (`p2`) itself. As we have crafted that `PREV_INUSE (P) == 0`,
+we can successfully bypass `if (!nextinuse)` and enter `unlink`!
+
+## Off-by-one
+
+@img(w75%, img/heap/heap-off-by-one.svg, Heap off-by-one attack.)
+
+Off-by-one means that when data is written to a buffer, the number of bytes
+written exceeds the size of the buffer by only one byte. The most common case is
+that one extra NULL byte is written (e.g. recall strcpy from previous labs),
+which makes `PREV_INUSE (P) == 0` so the previous block is considered a
+**fake** free chunk. You can now launch **unsafe unlink** attack introduced in
+the previous section.
+
+```c
+/* extract inuse bit of previous chunk */
+#define prev_inuse(p)       ((p)->size & PREV_INUSE)
+...
+static void
+_int_free (mstate av, mchunkptr p, int have_lock)
+{
+  ...
+  /* consolidate backward */
+  if (!prev_inuse(p)) {
+    prevsize = p->prev_size;
+    size += prevsize;
+    p = chunk_at_offset(p, -((long) prevsize));
+    unlink(av, p, bck, fwd);
+  }
+  ...
+}
+```
+
+Here we can try to trigger **backward consolidation**. When `free(p2)`, since
+the first chunk (`p1`) is "free" (`PREV_INUSE (P) == 0`), `_int_free()` will
+try to consolidate the first chunk (`p1`) backward and invoke `unlink`. We can
+therefore launch unlink attack by preparing malicious `FD` and `BK` in the
+first chunk (`p1`).
+
+## Double-free (FLAG HERE!)
+
+Now let's get our hand dirty and get a flag using another heap exploit
+technique called double-free. Specifically, we are going to talk about
+double-free in **tcache**.
+
+A new heap caching mechanism called **tcache** (thread local caching) was
+introduced in glibc 2.26 back in 2017. Tcache offers significant performance
+gains by creating per-thread caches for chunks up to a certain size.
+Operations on tcache bins require no locking, hence the speed improvements.
+The malloc algorithms will first look into tcache bins before traversing fast,
+small, large or unsorted bins, whenever a chunk is allocated or freed.
+
+A singly linked list is used to manage tcache bins as chunks in tcache are
+never removed from the middle of the list, but follow LIFO (last-in-first-out)
+order. Two particular structures are introduced: `tcache_perthread_struct`
+and `tcache_entry`.
+
+`malloc.c`:
+```c
+/* We overlay this structure on the user-data portion of a chunk when
+   the chunk is stored in the per-thread cache.  */
+typedef struct tcache_entry
+{
+  struct tcache_entry *next;
+} tcache_entry;
+
+/* There is one of these for each thread, which contains the
+   per-thread cache (hence "tcache_perthread_struct").  Keeping
+   overall size low is mildly important.  Note that COUNTS and ENTRIES
+   are redundant (we could have just counted the linked list each
+   time), this is for performance reasons.  */
+typedef struct tcache_perthread_struct
+{
+  char counts[TCACHE_MAX_BINS];
+  tcache_entry *entries[TCACHE_MAX_BINS];
+} tcache_perthread_struct;
+```
+
+There are 64 singly-linked bins per thread by default, for chunksizes from 24
+to 1032 (12 to 516 on x86) bytes, in 16 (8) byte increments. A single tcache
+bin contains at most 7 chunks by default.
+
+```c
+/* This is another arbitrary limit, which tunables can change.  Each
+   tcache bin will hold at most this number of chunks.  */
+# define TCACHE_FILL_COUNT 7
+```
+
+```c
+/* We want 64 entries.  This is an arbitrary limit, which tunables can reduce.  */
+# define TCACHE_MAX_BINS                64
+```
+
+Two functions are added to modern libc for tcache management: `tcache_put` and
+`tcache_get`.
+
+```c
+/* Caller must ensure that we know tc_idx is valid and there's room
+   for more chunks.  */
+static __always_inline void
+tcache_put (mchunkptr chunk, size_t tc_idx)
+{
+  tcache_entry *e = (tcache_entry *) chunk2mem (chunk);
+  assert (tc_idx < TCACHE_MAX_BINS);
+  e->next = tcache->entries[tc_idx];
+  tcache->entries[tc_idx] = e;
+  ++(tcache->counts[tc_idx]);
+}
+
+/* Caller must ensure that we know tc_idx is valid and there's
+   available chunks to remove.  */
+static __always_inline void *
+tcache_get (size_t tc_idx)
+{
+  tcache_entry *e = tcache->entries[tc_idx];
+  assert (tc_idx < TCACHE_MAX_BINS);
+  assert (tcache->entries[tc_idx] > 0);
+  tcache->entries[tc_idx] = e->next;
+  --(tcache->counts[tc_idx]);
+  return (void *) e;
+}
+```
+
+When a chunk is freed, `__int_free()` is invoked and based on certain
+condition, `tcache_put()` will be called to put the chunk into tcache.
+
+```c
+#if USE_TCACHE
+  {
+    size_t tc_idx = csize2tidx (size);
+
+    if (tcache
+        && tc_idx < mp_.tcache_bins
+        && tcache->counts[tc_idx] < mp_.tcache_count)
+      {
+        tcache_put (p, tc_idx);
+        return;
+      }
+  }
+#endif
+```
+
+And when a chunk is requested, malloc algorithm will first check whether the
+chunk of the requested size is available in tcache bins. If yes,
+`tcache_get()` will be called to retrieve it.
+
+```c
+
+#if USE_TCACHE
+  /* int_free also calls request2size, be careful to not pad twice.  */
+  size_t tbytes;
+  checked_request2size (bytes, tbytes);
+  size_t tc_idx = csize2tidx (tbytes);
+
+  MAYBE_INIT_TCACHE ();
+
+  DIAG_PUSH_NEEDS_COMMENT;
+  if (tc_idx < mp_.tcache_bins
+      /*&& tc_idx < TCACHE_MAX_BINS*/ /* to appease gcc */
+      && tcache
+      && tcache->entries[tc_idx] != NULL)
+    {
+      return tcache_get (tc_idx);
+    }
+  DIAG_POP_NEEDS_COMMENT;
+#endif
+```
+
+Let's take a look at `tcache-example` binary to get a better sense of how
+tcache actually works.  This binary allocates in total 9 chunks, where 4 are
+of size 0x30, 2 are of 0x40, 2 are of 0x50 and 1 is 0x430. At the end of the
+program, all of the first 8 are freed. As we can imagine, the first 7 should
+be recycled to tcache bins and the 8th one will be recycled to unsorted bin
+due to it's large size.
+
+Let's confirm it in pwndbg:
+
+```sh
+pwndbg> b * main + 296
+Breakpoint 1 at 0x80485de: file tcache-example.c, line 32.
+pwndbg> r
+Starting program: /home/lab09/tut09-advheap/tcache-example
+...
+Breakpoint * main + 296
+pwndbg> bins
+tcachebins
+0x20 [  3]: 0x804b1c0 —▸ 0x804b190 —▸ 0x804b160 ◂— 0x0
+0x28 [  2]: 0x804b230 —▸ 0x804b1f0 ◂— 0x0
+0x30 [  2]: 0x804b2c0 —▸ 0x804b270 ◂— 0x0
+fastbins
+0x10: 0x0
+0x18: 0x0
+0x20: 0x0
+0x28: 0x0
+0x30: 0x0
+0x38: 0x0
+0x40: 0x0
+unsortedbin
+all: 0x804b308 —▸ 0xf7fb17d8 (main_arena+56) ◂— 0x804b308
+smallbins
+empty
+largebins
+empty
+```
+
+Now, let's talk about **double-free**.
+
+A double-free vulnerability occurs when a veriable is `free()`'d twice. The
+implications of a double-free are often memory leaks and arbitrary writes, but
+the possibilities are endless.
+
+Before tcache is added to libc, when a chunk is freed, malloc algorithm checks
+whether that chunk is already at the top of the bin (already freed). If yes,
+an ERROR `"double free or corruption (fasttop)"` will be thrown, causing
+`SIGABRT`. However, such check is not conducted along the code path involving
+tcache, which makes double-free exploit even easier.
+
+In new libc where tcache is introduced (>2.26):
+
+```c
+#include <stdlib.h>
+#include <stdio.h>
+
+int main()
+{
+  char *a = malloc(0x38);
+  free(a);
+  free(a);
+  printf("%p\n", malloc(0x38));
+  printf("%p\n", malloc(0x38));
+}
+```
+No surprise, we get the **same pointer** twice.
+
+In old libc (<2.26):
+
+```c
+#include <stdlib.h>
+#include <stdio.h>
+
+int main()
+{
+  printf("%s","hello\n");
+  char *a = malloc(0x38);
+  char *b = malloc(0x38);
+  free(a);
+  free(b);
+  free(a);
+  printf("%p\n", malloc(0x38));
+  printf("%p\n", malloc(0x38));
+  printf("%p\n", malloc(0x38));
+}
+```
+output:
+
+```sh
+hello
+0x8943570
+0x89435b0
+0x8943570
+```
+
+The extra effort required to trigger double-free in old libc is exactly due to
+the integrity check introduced above.
+
+So, what are the interesting things we can do using double-free vulnerability?
+As you can imagine, using double-free, we can assign the same memory location
+to two variables. Operations on those two variable can vary, depending on the
+program logic, yet they are affecting the same memory location! By carefully
+choosing the two controlling variables, we can achieve unintended behaviors,
+such as arbitrary write.
+
+Now let's try to exploit the target program to spit out the flag for you! The
+target program is a simple notebook kept by an Admin. You can add, delete or
+edit a note. You can also call the Admin for privileged requests. Do you spot
+the design flaw? It will be a double-free vulnerability, of course ;)
+
+> **[TASK]**: In target, can you call the Admin back and bring you the flag?
+
+### Real world heap
+
+Luckily in modern libc heap implementations various security checks are applied
+to detect and prevent such vulnerabilities. A curated list of applied security
+checks can be found [here](https://heap-exploitation.dhavalkapil.com/diving_into_glibc_heap/security_checks.html).
+
+Our adventure ends here. In fact, a lot of interesting facts about the glibc
+heap implementation have not been covered but you have already gained enough
+basic knowledge to move forward. Check the references for further information.
+
+Last but not least, the source of the glibc heap is always your best helper in
+this lab (it is available online at [here](https://github.com/lattera/glibc/blob/master/malloc/)).
+There is no magic or secret behind the heap!
+
+## Reference
+
+- [Educational Heap Exploitation](https://github.com/shellphish/how2heap)
+- [Heap Exploitation by Dhaval (former student)](https://heap-exploitation.dhavalkapil.com/)
+- [A Memory Allocator](http://gee.cs.oswego.edu/dl/html/malloc.html)
+- [Phrack magazine on malloc](http://phrack.org/issues/57/8.html)
+- [Exploiting the heap](http://www.win.tue.nl/~aeb/linux/hh/hh-11.html)
+- [Understanding the Heap & Exploiting Heap Overflows](http://www.mathyvanhoef.com/2013/02/understanding-heap-exploiting-heap.html)
+- [The Shellcoder's Handbook: Discovering and Exploiting Security Holes, p89-107](https://goo.gl/vMXBn7)
+- [The Malloc Maleficarum](https://packetstormsecurity.com/files/40638/MallocMaleficarum.txt.html)
+- [Frontlink Arbitrary Allocation](https://github.com/Scepticz/Glibc-Malloc-POCs/blob/master/frontlink_arbitrary_allocation.c)
